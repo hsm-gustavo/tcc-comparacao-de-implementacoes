@@ -1,0 +1,16 @@
+name: distributed-lab-mq
+# not all services use mq
+include:
+  - compose.infra.yaml
+
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "5672:5672"
+      - "15672:15672"

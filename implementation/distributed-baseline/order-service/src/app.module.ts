@@ -5,18 +5,26 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { Order } from './order/entities/order.entity';
 import { OrderItem } from './order/entities/order-item.entity';
 import { OrderModule } from './order/order.module';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 
 @Module({
   imports: [
-    TypeOrmModule.forRoot({
-      type: 'postgres',
-      host: 'localhost',
-      port: 5434,
-      username: 'user',
-      password: 'password',
-      database: 'order',
-      entities: [Order, OrderItem],
-      synchronize: true,
+    ConfigModule.forRoot({
+      isGlobal: true,
+    }),
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => ({
+        type: 'postgres',
+        host: configService.get<string>('POSTGRES_HOST', 'order-db'),
+        port: configService.get<number>('POSTGRES_PORT', 5432),
+        username: 'user',
+        password: 'password',
+        database: 'order',
+        entities: [Order, OrderItem],
+        synchronize: true,
+      }),
     }),
     TypeOrmModule.forFeature([Order, OrderItem]),
     OrderModule,

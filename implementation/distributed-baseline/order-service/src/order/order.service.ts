@@ -9,9 +9,12 @@ import { firstValueFrom } from 'rxjs';
 
 @Injectable()
 export class OrderService {
-  private readonly WAREHOUSE_URL = 'http://localhost:3001/warehouse';
-  private readonly BILLING_URL = 'http://localhost:3002/billing';
-  private readonly SHIPPING_URL = 'http://localhost:3003/shipping';
+  private readonly WAREHOUSE_URL =
+    process.env.WAREHOUSE_URL || 'http://localhost:3002/warehouse';
+  private readonly BILLING_URL =
+    process.env.BILLING_URL || 'http://localhost:3003/billing';
+  private readonly SHIPPING_URL =
+    process.env.SHIPPING_URL || 'http://localhost:3004/shipping';
 
   constructor(
     @InjectRepository(Order) private orderRepo: Repository<Order>,
@@ -63,8 +66,11 @@ export class OrderService {
       savedOrder.status = OrderStatus.CANCELLED;
       await this.orderRepo.save(savedOrder);
 
+      const detailMsg =
+        err.response?.data?.message || err.cause?.message || err.message;
+
       throw new InternalServerErrorException(
-        `Distributed Order failed: ${err}`,
+        `Distributed Order failed: ${detailMsg}`,
       );
     }
   }

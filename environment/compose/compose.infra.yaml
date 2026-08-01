@@ -1,0 +1,84 @@
+name: distributed-lab
+
+services:
+  warehouse-db:
+    image: postgres:15-alpine
+    container_name: warehouse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: warehouse
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5433:5432"
+    volumes:
+      - warehouse-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d warehouse"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  order-db:
+    image: postgres:15-alpine
+    container_name: order-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: order
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5434:5432"
+    volumes:
+      - order-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d order"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  billing-db:
+    image: postgres:15-alpine
+    container_name: billing-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: billing
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5435:5432"
+    volumes:
+      - billing-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d billing"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  shipping-db:
+    image: postgres:15-alpine
+    container_name: shipping-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: shipping
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5436:5432"
+    volumes:
+      - shipping-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d shipping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  warehouse-data:
+  order-data:
+  billing-data:
+  shipping-data:

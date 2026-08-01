@@ -1,44 +1,34 @@
 import http from 'k6/http';
 import { check } from 'k6';
 
-const VUS = Number(__ENV.VUS ?? 1);
-const DURATION = __ENV.DURATION ?? '30s';
-
 export const options = {
-  vus: VUS,
-  duration: DURATION,
-  gracefulStop: '10s',
-  summaryTrendStats: [
-    'avg',
-    'min',
-    'med',
-    'max',
-    'p(90)',
-    'p(95)',
-    'count',
-  ],
-  thresholds: {
-    http_req_failed: ['rate<0.01'],
-  },
+  vus: 1,
+  duration: '30s',
 };
 
 export function setup() {
-  const res = http.get('http://localhost:3000/warehouse/products')
+  const res = http.get('http://localhost:3002/warehouse/products');
 
   if (res.status !== 200) {
-    throw new Error(`Falha ao buscar produtos na etapa de setup. Status: ${res.status}`);
+    throw new Error(`Falha ao buscar produtos. Status: ${res.status}`);
   }
 
   const products = res.json();
+
   if (!Array.isArray(products) || products.length === 0) {
-    throw new Error('Nenhum produto encontrado no banco para rodar o benchmark. Execute o seed primeiro.');
+    throw new Error(
+      'Nenhum produto encontrado. Execute o seed antes do benchmark.',
+    );
   }
 
-  const targetProduct = products[Math.floor(Math.random() * products.length)];
+  const product = products.find(
+    (p) => p.name === 'Teclado Mecânico',
+  );
 
   return {
-    productId: targetProduct.id,
-  }
+    productId: product.id,
+    price: product.price,
+  };
 }
 
 export default function (data) {
@@ -46,6 +36,7 @@ export default function (data) {
     customerId: 'cust-123',
     productId: data.productId,
     quantity: 1,
+    amount: data.price,
   });
 
   const params = {
@@ -54,9 +45,17 @@ export default function (data) {
     },
   };
 
-  const res = http.post('http://localhost:3000/orders', payload, params);
+  const res = http.post(
+    'http://localhost:3001/orders',
+    payload,
+    params,
+  );
 
-  check(res, {
-    'status is 201 or 200': (r) => r.status === 201 || r.status === 200,
+  const passed = check(res, {
+    'status is 201': (r) => r.status === 201,
   });
+
+  if (!passed) {
+    console.error(`[FALHA] Status: ${res.status} | Body: ${res.body}`);
+  }
 }

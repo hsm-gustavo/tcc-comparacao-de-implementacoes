@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   InternalServerErrorException,
+  Logger,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { WarehouseService } from 'src/warehouse/warehouse.service';
@@ -13,6 +14,8 @@ import { OrderItem } from './entities/order-item.entity';
 
 @Injectable()
 export class OrderService {
+  private readonly logger = new Logger(OrderService.name);
+
   constructor(
     private dataSource: DataSource,
     private warehouseService: WarehouseService,
@@ -25,14 +28,24 @@ export class OrderService {
     quantity: number,
     clientAmount?: number,
   ) {
+    const startedAt = performance.now();
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
+    await this.measure('database.transaction.connect', () =>
+      queryRunner.connect(),
+    );
+    await this.measure('database.transaction.start', () =>
+      queryRunner.startTransaction(),
+    );
 
     try {
-      const product = await queryRunner.manager.findOne(Product, {
-        where: { id: productId },
-      });
+      const product = await this.measure(
+        'database.product.find',
+        () =>
+          queryRunner.manager.findOne(Product, {
+            where: { id: productId },
+          }),
+        { productId },
+      );
 
       if (!product) throw new BadRequestException('Product not found');
 
@@ -48,15 +61,20 @@ export class OrderService {
 
       // tenta decrementar o estoque atomicamente
       // note que isso só é possível pq estamos em um monolito
-      const updateResult = await queryRunner.manager
-        .createQueryBuilder()
-        .update(Product)
-        .set({ stockQuantity: () => `stockQuantity - ${quantity}` })
-        .where('id = :id AND stockQuantity >= :quantity', {
-          id: productId,
-          quantity: quantity,
-        })
-        .execute();
+      const updateResult = await this.measure(
+        'database.product.stock-decrement',
+        () =>
+          queryRunner.manager
+            .createQueryBuilder()
+            .update(Product)
+            .set({ stockQuantity: () => `stockQuantity - ${quantity}` })
+            .where('id = :id AND stockQuantity >= :quantity', {
+              id: productId,
+              quantity,
+            })
+            .execute(),
+        { productId, quantity },
+      );
 
       if (updateResult.affected === 0) {
         throw new BadRequestException(
@@ -69,46 +87,150 @@ export class OrderService {
         totalAmount: calculatedTotal,
         status: OrderStatus.PENDING,
       });
-      const savedOrder = await queryRunner.manager.save(order);
+      const savedOrder = await this.measure(
+        'database.order.save',
+        () => queryRunner.manager.save(order),
+        { productId, customerId },
+      );
 
       const orderItem = queryRunner.manager.create(OrderItem, {
         order: savedOrder,
         product: product,
         quantity: quantity,
       });
-      await queryRunner.manager.save(orderItem);
-
-      await this.warehouseService.reserveStock(
-        productId,
-        quantity,
-        queryRunner.manager,
+      await this.measure(
+        'database.order-item.save',
+        () => queryRunner.manager.save(orderItem),
+        { orderId: savedOrder.id, productId },
       );
 
-      await this.billingService.processPayment(
-        savedOrder,
-        calculatedTotal,
-        queryRunner.manager,
+      await this.measure(
+        'in-process.warehouse.reserve',
+        () =>
+          this.warehouseService.reserveStock(
+            productId,
+            quantity,
+            queryRunner.manager,
+          ),
+        { orderId: savedOrder.id, productId },
       );
 
-      await this.shippingService.createShipment(
-        savedOrder,
-        queryRunner.manager,
+      await this.measure(
+        'in-process.billing.process',
+        () =>
+          this.billingService.processPayment(
+            savedOrder,
+            calculatedTotal,
+            queryRunner.manager,
+          ),
+        { orderId: savedOrder.id, productId },
+      );
+
+      await this.measure(
+        'in-process.shipping.create',
+        () =>
+          this.shippingService.createShipment(savedOrder, queryRunner.manager),
+        { orderId: savedOrder.id, productId },
       );
 
       savedOrder.status = OrderStatus.CONFIRMED;
-      await queryRunner.manager.save(savedOrder);
+      await this.measure(
+        'database.order.confirm',
+        () => queryRunner.manager.save(savedOrder),
+        { orderId: savedOrder.id },
+      );
 
-      await queryRunner.commitTransaction();
-      return savedOrder;
-    } catch (err) {
-      await queryRunner.rollbackTransaction();
+      await this.measure('database.transaction.commit', () =>
+        queryRunner.commitTransaction(),
+      );
 
-      if (err instanceof BadRequestException) {
-        throw err;
+      const durationMs = this.elapsed(startedAt);
+      if (durationMs >= 8000) {
+        this.logger.log({
+          event: 'monolith-order.completed',
+          orderId: savedOrder.id,
+          productId,
+          durationMs,
+        });
       }
-      throw new InternalServerErrorException(`Order failed: ${err}`);
+
+      return savedOrder;
+    } catch (error: unknown) {
+      await this.measure('database.transaction.rollback', () =>
+        queryRunner.rollbackTransaction(),
+      );
+
+      const details = this.extractErrorDetails(error);
+      this.logger.error({
+        event: 'monolith-order.failed',
+        productId,
+        durationMs: this.elapsed(startedAt),
+        ...details,
+      });
+
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(
+        `Order failed: ${details.message}`,
+      );
     } finally {
       await queryRunner.release();
     }
+  }
+
+  private async measure<T>(
+    operation: string,
+    callback: () => Promise<T>,
+    context: Record<string, unknown> = {},
+  ): Promise<T> {
+    const startedAt = performance.now();
+
+    try {
+      const result = await callback();
+      const durationMs = this.elapsed(startedAt);
+
+      if (durationMs >= 8000) {
+        this.logger.log({
+          event: 'operation.completed',
+          operation,
+          durationMs,
+          ...context,
+        });
+      }
+
+      return result;
+    } catch (error: unknown) {
+      const details = this.extractErrorDetails(error);
+
+      this.logger.error({
+        event: 'operation.failed',
+        operation,
+        durationMs: this.elapsed(startedAt),
+        ...context,
+        ...details,
+      });
+
+      throw error;
+    }
+  }
+
+  private extractErrorDetails(error: unknown) {
+    if (error instanceof Error) {
+      return {
+        type: 'error',
+        message: error.message,
+        errorName: error.name,
+      };
+    }
+
+    return {
+      type: 'unknown',
+      message: String(error),
+    };
+  }
+
+  private elapsed(startedAt: number): number {
+    return Number((performance.now() - startedAt).toFixed(2));
   }
 }

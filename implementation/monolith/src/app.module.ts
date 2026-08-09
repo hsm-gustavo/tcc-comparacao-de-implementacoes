@@ -16,13 +16,18 @@ import { OrderItem } from './order/entities/order-item.entity';
   imports: [
     TypeOrmModule.forRoot({
       type: 'postgres',
-      host: 'localhost',
+      host: 'monolith-db', // mude para localhost para testes locais
       port: 5432,
       username: 'user',
       password: 'password',
       database: 'db',
       entities: [Payment, Shipment, Product, Order, OrderItem],
       synchronize: true,
+      extra: {
+        max: 20,
+        connectionTimeoutMillis: 15000,
+        idleTimeoutMillis: 30000,
+      },
     }),
     TypeOrmModule.forFeature([Payment, Shipment, Product, Order, OrderItem]),
     WarehouseModule,

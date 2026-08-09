@@ -5,13 +5,19 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { Order } from './entities/order.entity';
 import { OrderItem } from './entities/order-item.entity';
 import { HttpModule } from '@nestjs/axios';
+import * as http from 'node:http';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([Order, OrderItem]),
     HttpModule.register({
       timeout: 5000,
-      maxRedirects: 5,
+      httpAgent: new http.Agent({
+        keepAlive: true,
+        maxSockets: 100,
+        maxFreeSockets: 100,
+        timeout: 15000,
+      }),
     }),
   ],
   controllers: [OrderController],

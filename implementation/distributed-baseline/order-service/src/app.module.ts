@@ -24,6 +24,11 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         database: 'order',
         entities: [Order, OrderItem],
         synchronize: true,
+        extra: {
+          max: 20,
+          connectionTimeoutMillis: 2000,
+          idleTimeoutMillis: 30000,
+        },
       }),
     }),
     TypeOrmModule.forFeature([Order, OrderItem]),

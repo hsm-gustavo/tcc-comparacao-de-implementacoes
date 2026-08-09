@@ -22,7 +22,11 @@ export class WarehouseService {
   }
 
   async findAll() {
-    return this.productsRepository.find();
+    return this.productsRepository.find({
+      order: {
+        id: 'ASC',
+      },
+    });
   }
 
   async findOne(id: string) {
@@ -34,18 +38,40 @@ export class WarehouseService {
   }
 
   async reserveStock(dto: ReserveStockDto) {
-    const product = await this.productsRepository.findOneBy({
+    const result = await this.productsRepository
+      .createQueryBuilder()
+      .update()
+      .set({
+        stockQuantity: () => `"stockQuantity" - :quantity`,
+      })
+      .where('id = :productId', {
+        productId: dto.productId,
+      })
+      .andWhere('"stockQuantity" >= :quantity', {
+        quantity: dto.quantity,
+      })
+      .setParameters({
+        quantity: dto.quantity,
+      })
+      .execute();
+
+    if (result.affected === 1) {
+      return {
+        productId: dto.productId,
+        quantity: dto.quantity,
+        reserved: true,
+      };
+    }
+
+    const productExists = await this.productsRepository.existsBy({
       id: dto.productId,
     });
 
-    if (!product) throw new NotFoundException('Product not found');
-
-    if (product.stockQuantity < dto.quantity) {
-      throw new BadRequestException('Insufficient stock');
+    if (!productExists) {
+      throw new NotFoundException('Product not found');
     }
 
-    product.stockQuantity -= dto.quantity;
-    return this.productsRepository.save(product);
+    throw new BadRequestException('Insufficient stock');
   }
 
   async releaseStock(dto: ReleaseStockDto) {

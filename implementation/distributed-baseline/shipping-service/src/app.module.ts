@@ -23,6 +23,11 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         database: 'shipping',
         entities: [Shipment],
         synchronize: true,
+        extra: {
+          max: 20,
+          connectionTimeoutMillis: 2000,
+          idleTimeoutMillis: 30000,
+        },
       }),
     }),
     TypeOrmModule.forFeature([Shipment]),

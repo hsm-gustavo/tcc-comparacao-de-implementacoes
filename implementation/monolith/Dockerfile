@@ -25,6 +25,9 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm prune --prod
 FROM node:22-alpine AS runner
 WORKDIR /usr/src/app
 
+# instala curl para healthcheck
+RUN apk add --no-cache curl
+
 ENV NODE_ENV=production
 
 USER node

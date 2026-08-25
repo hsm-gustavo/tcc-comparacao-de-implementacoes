@@ -12,6 +12,8 @@ import { Order, OrderStatus } from './entities/order.entity';
 import { Product } from 'src/warehouse/entities/product.entity';
 import { OrderItem } from './entities/order-item.entity';
 
+const ENABLE_SLOW_LOGS = false;
+
 @Injectable()
 export class OrderService {
   private readonly logger = new Logger(OrderService.name);
@@ -145,7 +147,7 @@ export class OrderService {
       );
 
       const durationMs = this.elapsed(startedAt);
-      if (durationMs >= 8000) {
+      if (ENABLE_SLOW_LOGS && durationMs >= 8000) {
         this.logger.log({
           event: 'monolith-order.completed',
           orderId: savedOrder.id,
@@ -190,7 +192,7 @@ export class OrderService {
       const result = await callback();
       const durationMs = this.elapsed(startedAt);
 
-      if (durationMs >= 8000) {
+      if (ENABLE_SLOW_LOGS && durationMs >= 8000) {
         this.logger.log({
           event: 'operation.completed',
           operation,

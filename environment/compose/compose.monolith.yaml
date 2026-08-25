@@ -1,0 +1,54 @@
+services:
+  monolith-db:
+    image: postgres:15-alpine
+    container_name: monolith-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - monolith-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d db"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  monolith:
+    build:
+      context: ../../implementation/monolith
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    deploy:
+      replicas: 8
+    depends_on:
+      monolith-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  nginx-lb:
+    image: nginx:alpine
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    container_name: monolith-lb
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    volumes:
+      - ../nginx/monolith.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - monolith
+
+volumes:
+  monolith-data:

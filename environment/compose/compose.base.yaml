@@ -4,18 +4,35 @@ include:
   - compose.infra.yaml
 
 services:
+  distributed-lb:
+    image: nginx:alpine
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    container_name: distributed-lb
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    volumes:
+      - ../nginx/distributed.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - order-service
+      - warehouse-service
+      - billing-service
+      - shipping-service
+
   order-service:
     build:
       context: ../../implementation/distributed-baseline/order-service
       dockerfile: Dockerfile
-    container_name: order-service
     restart: unless-stopped
-    ports:
-      - "3001:3001"
     environment:
-      - WAREHOUSE_URL=http://warehouse-service:3002/warehouse
-      - BILLING_URL=http://billing-service:3003/billing
-      - SHIPPING_URL=http://shipping-service:3004/shipping
+      # Internal traffic bypasses the edge proxy; Nginx remains the public
+      # entry point used by k6.
+      - WAREHOUSE_URL=http://distributed-lb/warehouse
+      - BILLING_URL=http://distributed-lb/billing
+      - SHIPPING_URL=http://distributed-lb/shipping
     depends_on:
       order-db:
         condition: service_healthy
@@ -24,10 +41,7 @@ services:
     build:
       context: ../../implementation/distributed-baseline/warehouse-service
       dockerfile: Dockerfile
-    container_name: warehouse-service
     restart: unless-stopped
-    ports:
-      - "3002:3002"
     depends_on:
       warehouse-db:
         condition: service_healthy
@@ -36,10 +50,7 @@ services:
     build:
       context: ../../implementation/distributed-baseline/billing-service
       dockerfile: Dockerfile
-    container_name: billing-service
     restart: unless-stopped
-    ports:
-      - "3003:3003"
     depends_on:
       billing-db:
         condition: service_healthy
@@ -48,10 +59,7 @@ services:
     build:
       context: ../../implementation/distributed-baseline/shipping-service
       dockerfile: Dockerfile
-    container_name: shipping-service
     restart: unless-stopped
-    ports:
-      - "3004:3004"
     depends_on:
       shipping-db:
         condition: service_healthy

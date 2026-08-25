@@ -1,57 +1,164 @@
 import http from 'k6/http';
 import { check } from 'k6';
+import exec from 'k6/execution';
+import { Counter, Rate, Trend } from 'k6/metrics';
+
+const BASE_URL = __ENV.BASE_URL || 'http://127.0.0.1:8000';
+const WAREHOUSE_PREFIX = __ENV.WAREHOUSE_PREFIX ?? '/warehouse';
+const RATE = 55;
+
+const createdOrders = new Counter('created_orders');
+
+const technicalFailures = new Rate(
+  'technical_failure_rate',
+);
+
+const successfulDuration = new Trend(
+  'successful_request_duration',
+  true,
+);
+
+const serverErrors = new Counter('server_errors');
+const clientTimeouts = new Counter('client_timeouts');
 
 export const options = {
-  vus: 300, // ou 200, depende do hardware
-  duration: '1m',
+  scenarios: {
+    orders: {
+      executor: 'constant-arrival-rate',
+
+      rate: RATE,
+      timeUnit: '1s',
+      duration: '2m',
+
+      preAllocatedVUs: 500,
+      maxVUs: 500,
+
+      gracefulStop: '30s',
+    },
+  },
+
+  thresholds: {
+    dropped_iterations: ['count==0'],
+    technical_failure_rate: ['rate<0.01'],
+  },
 };
 
 export function setup() {
-  const res = http.get('http://localhost:3002/warehouse/products');
+  const res = http.get(
+    `${BASE_URL}${WAREHOUSE_PREFIX}/products`,
+    {
+      timeout: '10s',
+      tags: {
+        endpoint: 'list-products',
+      },
+    },
+  );
 
   if (res.status !== 200) {
-    throw new Error(`Falha ao buscar produtos. Status: ${res.status}`);
+    throw new Error(
+      `Falha ao buscar produtos. Status: ${res.status}`,
+    );
   }
 
   const products = res.json();
 
-  if (!Array.isArray(products) || products.length === 0) {
+  if (
+    !Array.isArray(products) ||
+    products.length === 0
+  ) {
     throw new Error(
       'Nenhum produto encontrado. Execute o seed antes do benchmark.',
     );
   }
 
-  const product = products.find(
-    (p) => p.name === 'Teclado Mecânico',
-  );
-
   return {
-    productId: product.id,
-    price: product.price,
+    products: products.map((product) => ({
+      id: product.id,
+      price: product.price,
+    })),
   };
 }
 
 export default function (data) {
-  const payload = JSON.stringify({
-    customerId: 'cust-123',
-    productId: data.productId,
-    quantity: 1,
-    amount: data.price,
-  });
+  const iteration =
+    exec.scenario.iterationInTest;
 
-  const params = {
-    headers: {
-      'Content-Type': 'application/json',
-    },
-  };
+  const product =
+    data.products[
+      iteration % data.products.length
+    ];
+
+  const requestId =
+    `k6-high-${exec.vu.idInTest}-${iteration}`;
+
+  const payload = JSON.stringify({
+    customerId: `customer-${iteration}`,
+    productId: product.id,
+    quantity: 1,
+    amount: product.price,
+  });
 
   const res = http.post(
-    'http://localhost:3001/orders',
+    `${BASE_URL}/orders`,
     payload,
-    params,
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Request-Id': requestId,
+      },
+
+      timeout: '20s',
+
+      tags: {
+        endpoint: 'create-order',
+        load: 'high',
+      },
+    },
   );
 
+  const success = res.status === 201;
+
+  technicalFailures.add(!success);
+
+  if (success) {
+    createdOrders.add(1);
+
+    successfulDuration.add(
+      res.timings.duration,
+    );
+  }
+
+  if (res.status >= 500) {
+    serverErrors.add(1);
+  }
+
+  if (
+    res.status === 0 &&
+    res.error
+      ?.toLowerCase()
+      .includes('timeout')
+  ) {
+    clientTimeouts.add(1);
+  }
+
   check(res, {
-    'status is 201': (r) => r.status === 201,
+    'status is 201': (response) =>
+      response.status === 201,
   });
+
+  if (!success) {
+    console.error(
+      JSON.stringify({
+        requestId,
+        iteration,
+        productId: product.id,
+        status: res.status,
+        error: res.error,
+        errorCode: res.error_code,
+        body: res.body,
+        duration: res.timings.duration,
+        waiting: res.timings.waiting,
+      }),
+    );
+  }
 }

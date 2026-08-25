@@ -2,35 +2,59 @@
 
 set -euo pipefail
 
-WAREHOUSE_URL="${WAREHOUSE_URL:-http://localhost:3002}"
+MODE="${1:-${MODE:-distributed}}"
+PRODUCT_COUNT="${PRODUCT_COUNT:-100}"
+INITIAL_STOCK="${INITIAL_STOCK:-100000}"
 
-echo "Waiting Warehouse Service..."
+if [[ "$MODE" == "monolith" ]]; then
+    BASE_URL="http://127.0.0.1:3000"
+    PREFIX=""
+elif [[ "$MODE" == "distributed" ]]; then
+    BASE_URL="http://127.0.0.1:8000"
+    PREFIX="/warehouse"
+else
+    echo "Error: Mode '$MODE' invalid. Use 'monolith' or 'distributed'."
+    exit 1
+fi
 
-until curl -sf "$WAREHOUSE_URL/health" >/dev/null 2>&1; do
+HEALTH_URL="${BASE_URL}${PREFIX}/health"
+CREATE_PRODUCT_URL="${BASE_URL}/warehouse/products"
+
+echo "Waiting Warehouse Service ($HEALTH_URL)..."
+
+until curl -sf "$HEALTH_URL" >/dev/null 2>&1; do
     sleep 1
 done
 
-echo "Creating products..."
+echo "Creating $PRODUCT_COUNT products..."
 
-products=(
-'{"name":"Teclado Mecânico","price":299.9,"stockQuantity":100000}'
-'{"name":"Mouse Sem Fio","price":149.5,"stockQuantity":100000}'
-'{"name":"Monitor 24 Polegadas","price":899.0,"stockQuantity":100000}'
-'{"name":"Headset Gamer","price":249.9,"stockQuantity":100000}'
-'{"name":"Webcam Full HD","price":189.9,"stockQuantity":100000}'
+for index in $(seq 1 "$PRODUCT_COUNT"); do
+    price_integer=$((100 + index))
+    price_decimal=$((index % 100))
+
+    product=$(cat <<EOF
+{
+  "name": "Benchmark Product $(printf '%03d' "$index")",
+  "price": ${price_integer}.$(printf '%02d' "$price_decimal"),
+  "stockQuantity": ${INITIAL_STOCK}
+}
+EOF
 )
 
-for product in "${products[@]}"; do
     curl \
         --silent \
         --show-error \
         --fail \
         -X POST \
-        "$WAREHOUSE_URL/warehouse/products" \
+        "$CREATE_PRODUCT_URL" \
         -H "Content-Type: application/json" \
-        -d "$product"
+        -d "$product" \
+        >/dev/null
 
-    echo
+    printf "\rCreated products: %d/%d" \
+        "$index" \
+        "$PRODUCT_COUNT"
 done
 
+echo
 echo "Seed completed."

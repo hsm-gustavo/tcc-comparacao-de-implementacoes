@@ -1,61 +1,65 @@
 import http from 'k6/http';
-import { check } from 'k6';
+import exec from 'k6/execution';
+
+const BASE_URL =
+  __ENV.BASE_URL || 'http://127.0.0.1:3000';
+
+const WAREHOUSE_PREFIX =
+  __ENV.WAREHOUSE_PREFIX ?? '/warehouse';
 
 export const options = {
-  vus: 1,
-  duration: '30s',
+  scenarios: {
+    warmup: {
+      executor: 'per-vu-iterations',
+      vus: 20,
+      iterations: 1,
+      maxDuration: '30s',
+    },
+  },
 };
 
 export function setup() {
-  const res = http.get('http://localhost:3002/warehouse/products');
+  const res = http.get(
+    `${BASE_URL}${WAREHOUSE_PREFIX}/products`,
+    {
+      timeout: '10s',
+    },
+  );
 
   if (res.status !== 200) {
-    throw new Error(`Falha ao buscar produtos. Status: ${res.status}`);
-  }
-
-  const products = res.json();
-
-  if (!Array.isArray(products) || products.length === 0) {
     throw new Error(
-      'Nenhum produto encontrado. Execute o seed antes do benchmark.',
+      `Warmup setup failed: ${res.status}`,
     );
   }
 
-  const product = products.find(
-    (p) => p.name === 'Teclado Mecânico',
-  );
-
   return {
-    productId: product.id,
-    price: product.price,
+    products: res.json(),
   };
 }
 
 export default function (data) {
-  const payload = JSON.stringify({
-    customerId: 'cust-123',
-    productId: data.productId,
-    quantity: 1,
-    amount: data.price,
-  });
+  const iteration =
+    exec.scenario.iterationInTest;
 
-  const params = {
-    headers: {
-      'Content-Type': 'application/json',
+  const product =
+    data.products[
+      iteration % data.products.length
+    ];
+
+  http.post(
+    `${BASE_URL}/orders`,
+    JSON.stringify({
+      customerId:
+        `warmup-customer-${iteration}`,
+      productId: product.id,
+      quantity: 1,
+      amount: product.price,
+    }),
+    {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      timeout: '20s',
     },
-  };
-
-  const res = http.post(
-    'http://localhost:3001/orders',
-    payload,
-    params,
   );
-
-  const passed = check(res, {
-    'status is 201': (r) => r.status === 201,
-  });
-
-  if (!passed) {
-    console.error(`[FALHA] Status: ${res.status} | Body: ${res.body}`);
-  }
 }

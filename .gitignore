@@ -2,3 +2,5 @@
 .env.docker
 *.log
 *.csv
+.venv
+*.png

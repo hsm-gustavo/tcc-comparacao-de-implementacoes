@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-# Diretório onde estão:
+# dir pros csvs:
 # repusers100_run1.csv
 # repusers100_run2.csv
 # repusers200_run1.csv
@@ -43,8 +43,6 @@ def read_run(path: Path) -> dict:
         low_memory=False,
     )
 
-    # Considera somente as requisições reais do benchmark.
-    # Isso exclui o GET /warehouse/products do setup.
     requests = df[
         (df["metric_name"] == "http_req_duration")
         & (df["scenario"] == "concurrent_orders")
@@ -73,10 +71,6 @@ def read_run(path: Path) -> dict:
         * 100
     )
 
-    # Como cada VU executa exatamente uma requisição
-    # e todos começam aproximadamente juntos,
-    # o maior tempo de resposta aproxima a duração
-    # necessária para processar a rajada completa.
     execution_time_seconds = (
         durations.max() / 1000
     )
@@ -166,14 +160,11 @@ def aggregate_runs(
                 "count",
             ),
 
-            # Latência média entre as repetições.
             latency_mean_ms=(
                 "latency_mean_ms",
                 "mean",
             ),
 
-            # Desvio padrão da latência média
-            # entre as repetições.
             latency_std_ms=(
                 "latency_mean_ms",
                 "std",
@@ -199,27 +190,21 @@ def aggregate_runs(
                 "mean",
             ),
 
-            # Throughput médio entre as repetições.
             throughput_req_s=(
                 "throughput_req_s",
                 "mean",
             ),
 
-            # Desvio padrão do throughput
-            # entre as repetições.
             throughput_std=(
                 "throughput_req_s",
                 "std",
             ),
 
-            # Disponibilidade média entre as repetições.
             availability_pct=(
                 "availability_pct",
                 "mean",
             ),
 
-            # Desvio padrão da disponibilidade
-            # entre as repetições.
             availability_std=(
                 "availability_pct",
                 "std",

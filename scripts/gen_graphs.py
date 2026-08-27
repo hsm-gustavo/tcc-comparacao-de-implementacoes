@@ -6,9 +6,9 @@ import pandas as pd
 
 
 # dir pros csvs:
-# repusers100_run1.csv
-# repusers100_run2.csv
-# repusers200_run1.csv
+# users100_run1.csv
+# users100_run2.csv
+# users200_run1.csv
 # ...
 DATASET_DIR = Path(
     "experiments/datasets/monolith"
@@ -23,7 +23,7 @@ OUTPUT_DIR.mkdir(
 
 
 FILE_PATTERN = re.compile(
-    r"repusers(?P<users>\d+)_run(?P<run>\d+)\.csv"
+    r"users(?P<users>\d+)_run(?P<run>\d+)\.csv"
 )
 
 
@@ -123,7 +123,7 @@ def load_all_runs() -> pd.DataFrame:
     results = []
 
     for path in sorted(
-        DATASET_DIR.glob("repusers*_run*.csv")
+        DATASET_DIR.glob("users*_run*.csv")
     ):
         try:
             result = read_run(path)
@@ -288,7 +288,7 @@ def plot_latency(
     )
 
     plt.savefig(
-        OUTPUT_DIR / "replatency.png",
+        OUTPUT_DIR / "latency.png",
         dpi=200,
     )
 
@@ -335,7 +335,7 @@ def plot_throughput(
     )
 
     plt.savefig(
-        OUTPUT_DIR / "repthroughput.png",
+        OUTPUT_DIR / "throughput.png",
         dpi=200,
     )
 
@@ -387,7 +387,7 @@ def plot_availability(
     )
 
     plt.savefig(
-        OUTPUT_DIR / "repavailability.png",
+        OUTPUT_DIR / "availability.png",
         dpi=200,
     )
 
@@ -402,12 +402,12 @@ def main():
     )
 
     runs.to_csv(
-        OUTPUT_DIR / "repruns.csv",
+        OUTPUT_DIR / "runs.csv",
         index=False,
     )
 
     summary.to_csv(
-        OUTPUT_DIR / "repsumary.csv",
+        OUTPUT_DIR / "sumary.csv",
         index=False,
     )
 

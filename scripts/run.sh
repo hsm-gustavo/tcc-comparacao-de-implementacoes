@@ -122,7 +122,7 @@ run_benchmark() {
   local users="$1"
   local repetition="$2"
 
-  local prefix="repusers${users}_run${repetition}"
+  local prefix="users${users}_run${repetition}"
 
   local csv_file="$RESULTS_DIR/${prefix}.csv"
   local console_file="$RESULTS_DIR/${prefix}_console.log"

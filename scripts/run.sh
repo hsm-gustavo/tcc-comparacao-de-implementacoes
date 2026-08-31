@@ -66,7 +66,7 @@ wait_for_service() {
 }
 
 wait_for_all_monolith_replicas() {
-  local expected=8
+  local expected=1
 
   echo "Waiting for all $expected monolith replicas to become healthy..."
 

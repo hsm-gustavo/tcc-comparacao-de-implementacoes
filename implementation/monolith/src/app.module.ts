@@ -24,7 +24,7 @@ import { OrderItem } from './order/entities/order-item.entity';
       entities: [Payment, Shipment, Product, Order, OrderItem],
       synchronize: true,
       extra: {
-        max: 5,
+        max: 20,
         connectionTimeoutMillis: 15000,
         idleTimeoutMillis: 30000,
       },

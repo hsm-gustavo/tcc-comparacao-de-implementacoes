@@ -8,11 +8,27 @@ const WAREHOUSE_PREFIX = __ENV.WAREHOUSE_PREFIX ?? '/warehouse';
 
 const USERS = Number(__ENV.USERS || 100);
 
+// desligar IO para nao atrapalhar os testes
+const LOG_ERRORS =
+  (__ENV.LOG_ERRORS ?? 'false')
+    .toLowerCase() === 'true';
+
 const createdOrders = new Counter('created_orders');
 
-const successfulDuration = new Trend(
-  'successful_request_duration',
+const successfulWaiting = new Trend(
+  'successful_request_waiting',
   true,
+);
+
+// instante real de inicio e fim das reqs
+const benchmarkRequestStartMs = new Trend(
+  'benchmark_request_start_ms',
+  false,
+);
+
+const benchmarkRequestEndMs = new Trend(
+  'benchmark_request_end_ms',
+  false,
 );
 
 const availability = new Rate(
@@ -110,6 +126,10 @@ export default function (data) {
     amount: product.price,
   });
 
+  const requestStartedAt = Date.now();
+
+  benchmarkRequestStartMs.add(requestStartedAt)
+
   const res = http.post(
     `${BASE_URL}/orders`,
     payload,
@@ -137,6 +157,10 @@ export default function (data) {
     }
   );
 
+  const requestEndedAt = Date.now();
+
+  benchmarkRequestEndMs.add(requestEndedAt);
+
   const success = res.status === 201;
 
   availability.add(success);
@@ -147,8 +171,8 @@ export default function (data) {
 
   if (success) {
     createdOrders.add(1);
-    successfulDuration.add(
-      res.timings.duration,
+    successfulWaiting.add(
+      res.timings.waiting,
     );
   }
 
@@ -170,7 +194,7 @@ export default function (data) {
         response.status === 201,
   });
 
-  if (!success) {
+  if (!success && LOG_ERRORS) {
     console.error(
       JSON.stringify({
         requestId,

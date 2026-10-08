@@ -44,7 +44,7 @@ def read_run(path: Path) -> dict:
     )
 
     requests = df[
-        (df["metric_name"] == "http_req_duration")
+        (df["metric_name"] == "http_req_waiting")
         & (df["scenario"] == "concurrent_orders")
     ].copy()
 
@@ -53,7 +53,10 @@ def read_run(path: Path) -> dict:
             f"Nenhuma requisição encontrada em {path}"
         )
 
-    durations = requests["metric_value"]
+    waiting_times = pd.to_numeric(
+        requests["metric_value"],
+        errors="coerce",
+    ).dropna()
 
     total_requests = len(requests)
 
@@ -71,9 +74,40 @@ def read_run(path: Path) -> dict:
         * 100
     )
 
+    start_samples = df[
+        (df["metric_name"] == "benchmark_request_start_ms")
+        & (df["scenario"] == "concurrent_orders")
+    ].copy()
+
+    end_samples = df[
+        (df["metric_name"] == "benchmark_request_end_ms")
+        & (df["scenario"] == "concurrent_orders")
+    ].copy()
+
+    if start_samples.empty or end_samples.empty:
+        raise ValueError(
+            f"Métricas de início/fim da rajada não encontradas em {path}. "
+        )
+
+    request_starts_ms = pd.to_numeric(
+        start_samples["metric_value"],
+        errors="coerce",
+    ).dropna()
+
+    request_ends_ms = pd.to_numeric(
+        end_samples["metric_value"],
+        errors="coerce",
+    ).dropna()
+
+    if request_starts_ms.empty or request_ends_ms.empty:
+        raise ValueError(
+            f"Valores inválidos nas métricas de início/fim em {path}"
+        )
+
     execution_time_seconds = (
-        durations.max() / 1000
-    )
+        request_ends_ms.max()
+        - request_starts_ms.min()
+    ) / 1000
 
     if execution_time_seconds > 0:
         throughput = (
@@ -100,19 +134,22 @@ def read_run(path: Path) -> dict:
             availability,
 
         "latency_mean_ms":
-            durations.mean(),
+            waiting_times.mean(),
 
         "latency_median_ms":
-            durations.median(),
+            waiting_times.median(),
 
         "latency_p90_ms":
-            durations.quantile(0.90),
+            waiting_times.quantile(0.90),
 
         "latency_p95_ms":
-            durations.quantile(0.95),
+            waiting_times.quantile(0.95),
 
         "latency_max_ms":
-            durations.max(),
+            waiting_times.max(),
+
+        "burst_duration_s":
+            execution_time_seconds,
 
         "throughput_req_s":
             throughput,
@@ -271,7 +308,7 @@ def plot_latency(
     )
 
     plt.title(
-        "Latência por nível de concorrência"
+        "Latência (TTFB) por nível de concorrência"
     )
 
     plt.grid(
@@ -407,7 +444,7 @@ def main():
     )
 
     summary.to_csv(
-        OUTPUT_DIR / "sumary.csv",
+        OUTPUT_DIR / "summary.csv",
         index=False,
     )
 

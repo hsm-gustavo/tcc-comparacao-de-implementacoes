@@ -6,6 +6,7 @@ import { Order } from './order/entities/order.entity';
 import { OrderItem } from './order/entities/order-item.entity';
 import { OrderModule } from './order/order.module';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { DiagnosticsModule } from './diagnostics/diagnostics.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
     }),
     TypeOrmModule.forFeature([Order, OrderItem]),
     OrderModule,
+    DiagnosticsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

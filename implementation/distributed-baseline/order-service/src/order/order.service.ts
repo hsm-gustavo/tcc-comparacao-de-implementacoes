@@ -14,6 +14,10 @@ import { firstValueFrom, Observable } from 'rxjs';
 import { AxiosResponse } from 'axios';
 import { AxiosError } from 'axios';
 import { isAxiosError } from 'axios';
+import {
+  diagnosticHttpConfig,
+  withDiagnosticOperation,
+} from '../diagnostics/context';
 
 @Injectable()
 export class OrderService {
@@ -64,10 +68,14 @@ export class OrderService {
       //2. Reserve stock
       await this.callService(
         'warehouse.reserve',
-        this.httpService.patch(`${this.WAREHOUSE_URL}/reserve`, {
-          productId: dto.productId,
-          quantity: dto.quantity,
-        }),
+        this.httpService.patch(
+          `${this.WAREHOUSE_URL}/reserve`,
+          {
+            productId: dto.productId,
+            quantity: dto.quantity,
+          },
+          diagnosticHttpConfig(),
+        ),
         {
           orderId: savedOrder.id,
           productId: dto.productId,
@@ -78,10 +86,14 @@ export class OrderService {
       // critical step: if payment fails, the catch runs but the stock is already deducted
       await this.callService(
         'billing.process',
-        this.httpService.post(`${this.BILLING_URL}/process`, {
-          orderId: savedOrder.id,
-          amount: dto.amount,
-        }),
+        this.httpService.post(
+          `${this.BILLING_URL}/process`,
+          {
+            orderId: savedOrder.id,
+            amount: dto.amount,
+          },
+          diagnosticHttpConfig(),
+        ),
         {
           orderId: savedOrder.id,
           productId: dto.productId,
@@ -91,9 +103,13 @@ export class OrderService {
       //4. Create shipment
       await this.callService(
         'shipping.create',
-        this.httpService.post(this.SHIPPING_URL, {
-          orderId: savedOrder.id,
-        }),
+        this.httpService.post(
+          this.SHIPPING_URL,
+          {
+            orderId: savedOrder.id,
+          },
+          diagnosticHttpConfig(),
+        ),
         {
           orderId: savedOrder.id,
           productId: dto.productId,
@@ -163,7 +179,9 @@ export class OrderService {
     const startedAt = performance.now();
 
     try {
-      const response = await firstValueFrom(request$);
+      const response = await withDiagnosticOperation(operation, context, () =>
+        firstValueFrom(request$),
+      );
       const tt = this.elapsed(startedAt);
       if (tt >= 8000) {
         this.logger.log({
@@ -207,7 +225,11 @@ export class OrderService {
     const startedAt = performance.now();
 
     try {
-      const result = await callback();
+      const result = await withDiagnosticOperation(
+        operation,
+        context,
+        callback,
+      );
 
       const tt = this.elapsed(startedAt);
       if (tt >= 8000) {

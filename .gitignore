@@ -7,3 +7,5 @@
 IMPLEMENTATION_AND_EXPERIMENT.md
 __pycache__
 test_clearml.py
+experiments/datasets/diagnostics/
+scripts/diagnostics/*.md

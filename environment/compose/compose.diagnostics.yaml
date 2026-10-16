@@ -1,0 +1,6 @@
+# Overlay only; all workload, database, HTTP and proxy settings come from base.
+services:
+  order-service:
+    environment:
+      DB_DIAGNOSTICS: ${DB_DIAGNOSTICS:-1}
+      RUN_ID: ${RUN_ID:-manual}

@@ -37,6 +37,7 @@ const BASE_URL = __ENV.BASE_URL || 'http://127.0.0.1:8000';
 const WAREHOUSE_PREFIX = __ENV.WAREHOUSE_PREFIX ?? '/warehouse';
 const ARCHITECTURE = __ENV.ARCHITECTURE || 'unspecified';
 const LOG_ERRORS = (__ENV.LOG_ERRORS ?? 'false').toLowerCase() === 'true';
+const PHASE = __ENV.PILOT_PHASE || 'benchmark';
 
 if (MAX_VUS < PRE_ALLOCATED_VUS) {
   throw new Error('MAX_VUS deve ser >= PRE_ALLOCATED_VUS.');
@@ -48,6 +49,7 @@ const technicalFailures = new Rate('technical_failure_rate');
 const serverErrors = new Counter('server_errors');
 const clientTimeouts = new Counter('client_timeouts');
 const successfulWaiting = new Trend('successful_request_waiting', true);
+const successfulDuration = new Trend('successful_request_duration', true);
 const scenarioStart = new Trend('pilot_scenario_start_ms');
 const requestEnd = new Trend('pilot_request_end_ms');
 
@@ -67,10 +69,10 @@ export const options = {
   // Limites neutros materializam as submétricas no handleSummary sem
   // escolher antecipadamente um critério de capacidade/saturação.
   thresholds: {
-    'http_reqs{phase:benchmark}': ['count>=0'],
-    'http_req_duration{phase:benchmark}': ['p(99)>=0'],
-    'http_req_waiting{phase:benchmark}': ['p(99)>=0'],
-    'http_req_failed{phase:benchmark}': ['rate>=0'],
+    [`http_reqs{phase:${PHASE}}`]: ['count>=0'],
+    [`http_req_duration{phase:${PHASE}}`]: ['p(99)>=0'],
+    [`http_req_waiting{phase:${PHASE}}`]: ['p(99)>=0'],
+    [`http_req_failed{phase:${PHASE}}`]: ['rate>=0'],
   },
 };
 
@@ -110,7 +112,7 @@ export default function (data) {
     timeout: '20s',
     redirects: 0,
     responseCallback: http.expectedStatuses(201),
-    tags: { endpoint: 'create-order', phase: 'benchmark', offered_rate: String(RATE) },
+    tags: { endpoint: 'create-order', phase: PHASE, offered_rate: String(RATE) },
   });
   requestEnd.add(Date.now());
   const accepted = res.status === 201;
@@ -120,7 +122,10 @@ export default function (data) {
   clientTimeouts.add(
     res.status === 0 && (res.error_code === 1050 || /timeout/i.test(res.error || '')) ? 1 : 0,
   );
-  if (accepted) successfulWaiting.add(res.timings.waiting);
+  if (accepted) {
+    successfulWaiting.add(res.timings.waiting);
+    successfulDuration.add(res.timings.duration);
+  }
   check(res, { 'HTTP 201: pedido aceito': (response) => response.status === 201 });
   if (!accepted && LOG_ERRORS) {
     console.error(JSON.stringify({
@@ -133,9 +138,10 @@ export default function (data) {
 export function handleSummary(data) {
   const values = (name) => data.metrics[name]?.values || {};
   const count = (name) => values(name).count || 0;
-  const latency = values('http_req_duration{phase:benchmark}');
+  const latency = values(`http_req_duration{phase:${PHASE}}`);
+  const successfulLatency = values('successful_request_duration');
   const started = count('started_requests');
-  const requests = count('http_reqs{phase:benchmark}');
+  const requests = count(`http_reqs{phase:${PHASE}}`);
   const accepted = count('created_orders');
   const startMs = values('pilot_scenario_start_ms').min;
   const endMs = values('pilot_request_end_ms').max;
@@ -146,12 +152,15 @@ export function handleSummary(data) {
     : DURATION_SECONDS;
   const summary = {
     architecture: ARCHITECTURE,
+    phase: PHASE,
     run_id: __ENV.RUN_ID || null,
     repetition: __ENV.REPETITION ? Number(__ENV.REPETITION) : null,
     rate: RATE,
     duration: DURATION,
     duration_seconds: DURATION_SECONDS,
     observation_seconds: observationSeconds,
+    scenario_start_ms: Number.isFinite(startMs) ? startMs : null,
+    request_end_ms: Number.isFinite(endMs) ? endMs : null,
     expected_iterations: RATE * DURATION_SECONDS,
     started_requests: started,
     requests,
@@ -164,8 +173,12 @@ export function handleSummary(data) {
     p95: requests ? latency['p(95)'] ?? null : null,
     p99: requests ? latency['p(99)'] ?? null : null,
     latency_mean_ms: requests ? latency.avg ?? null : null,
+    successful_latency_mean_ms: accepted ? successfulLatency.avg ?? null : null,
+    successful_p50_ms: accepted ? successfulLatency.med ?? null : null,
+    successful_p95_ms: accepted ? successfulLatency['p(95)'] ?? null : null,
+    successful_p99_ms: accepted ? successfulLatency['p(99)'] ?? null : null,
     error_rate: requests ? values('technical_failure_rate').rate ?? null : null,
-    http_error_rate: requests ? values('http_req_failed{phase:benchmark}').rate ?? null : null,
+    http_error_rate: requests ? values(`http_req_failed{phase:${PHASE}}`).rate ?? null : null,
     timeouts: count('client_timeouts'),
     server_errors: count('server_errors'),
     dropped_iterations: count('dropped_iterations'),

@@ -61,6 +61,41 @@ O cooldown não limpa caches nem reinicia serviços. A recuperação do pool do 
 não comprova que todos os efeitos distribuídos tardios terminaram. Consulte os
 logs quando houver timeout antes de reutilizar uma coleta parcial.
 
+### Repetições por nível
+
+`REPETITIONS` controla quantas vezes cada taxa é medida. O padrão é `1`.
+Para executar cinco repetições de três minutos em cada nível:
+
+```bash
+sudo RUN_ID=vm-pg-pilot-5reps-01 REPETITIONS=5 \
+  RATES=1,2,5,10,15,20,30,40 DURATION=3m WARMUP_DURATION=1m \
+  bash run.sh
+```
+
+Na máquina local, use outro identificador, como `RUN_ID=local-pg-pilot-5reps-01`.
+O valor pode ser qualquer inteiro positivo, por exemplo `REPETITIONS=3`, `5` ou
+`20`. A sequência para duas repetições será:
+
+```text
+warmup (uma vez)
+1/s:  repetição 1 → recuperação → repetição 2 → recuperação
+2/s:  repetição 1 → recuperação → repetição 2 → recuperação
+...
+40/s: repetição 1 → recuperação → repetição 2 → recuperação
+```
+
+`DURATION` vale para **cada repetição**, e o cooldown/verificação do pool ocorre
+também entre repetições da mesma taxa. O banco é reutilizado, sem reinício ou novo
+seed entre elas. Cada medição gera arquivos separados, como `rate20_run1.csv`,
+`rate20_run2.csv`, seus resumos JSON e logs. As tabelas preservam o número da
+repetição. Os gráficos resumem sua distribuição e permitem inspecionar cada
+execução nos mapas de calor e detalhes temporais por nível.
+
+Com oito níveis, três minutos de medição e 30s de cooldown, cinco repetições
+levam aproximadamente **2h22min**, mais build, readiness, drenagem e eventuais
+esperas adicionais. Vinte repetições levam aproximadamente **9h22min**, mais
+esses tempos. Aumentar repetições não multiplica a taxa de disparos por segundo.
+
 Todos os níveis usam `constant-arrival-rate`, não VUs como carga oferecida. O
 timeout HTTP do piloto continua 20s e gracefulStop 30s, como no piloto existente.
 Por padrão, `PRE_ALLOCATED_VUS=MAX_VUS=25 × maior taxa` (1000 para taxa máxima
@@ -91,10 +126,17 @@ experiments/datasets/pilot/<RUN_ID>/
   analysis/
     levels.csv                  # uma linha por patamar/repetição; aquecimento identificado
     windows.csv                 # janelas de 10s dentro dos patamares, inclusive janelas vazias
+    by_rate.csv                 # distribuição das métricas entre repetições de cada taxa
     summary.json                # advertências e semântica
-    capacity.png                # taxa solicitada, entregue, sucesso, latência, erros e descartes
-    timeline.png                # estabilidade dentro de cada patamar
-    pool.png                    # pool, aquisição, posse, SQL e event loop
+    availability.png            # HTTP 201 / requisições observadas (%), por nível
+    throughput.png              # disparos, respostas totais/s e respostas HTTP 201/s
+    latency.png                 # média, p95 e p99; todas as respostas e somente HTTP 201
+    capacity.png                # mediana, P25-P75 e pontos individuais, com legenda fixa
+    repetitions.png             # mapa taxa × repetição: p95, falhas e vazão relativa
+    timeline.png                # visão temporal geral, com um rótulo por nível
+    timeline_by_rate/rate20.png  # detalhe das repetições de cada nível (um arquivo por taxa)
+    pool.png                    # ocupação, fila, durações e event loop em painéis separados
+    pool_by_rate/rate20.png      # detalhe do pool por nível (um arquivo por taxa)
 ```
 
 Sem matplotlib, a coleta continua válida e as tabelas são geradas com a biblioteca
@@ -108,7 +150,53 @@ inclusive em outra máquina com a pasta completa copiada:
 # Só tabelas, sem dependências externas:
 python3 experiments/analyze_pilot.py \
   experiments/datasets/pilot/vm-pg-pilot-01 --no-plots
+
+# Refazer só a visualização de uma coleta já analisada, sem reler CSVs brutos do k6:
+.venv/bin/python experiments/analyze_pilot.py \
+  experiments/datasets/pilot/vm-pg-pilot-01 --plots-only
 ```
+
+Para muitas repetições, comece por `capacity.png` e `repetitions.png`. O primeiro
+mostra a **mediana das métricas por repetição**, com faixa entre P25 e P75 (IQR)
+e pontos individuais levemente deslocados na horizontal. Essa faixa descreve a
+variação observada; **não é intervalo de confiança**. A mediana dos p95 das
+repetições **não é o p95 global das requisições**. Nenhuma repetição completa é
+descartada por estar entre as primeiras ou por apresentar falhas.
+
+Os gráficos individuais `availability.png`, `throughput.png` e `latency.png`
+usam o mesmo resumo: mediana e P25–P75 entre repetições, com pontos individuais.
+Disponibilidade aqui é **sucesso HTTP por requisição** (`HTTP 201 / responses ×
+100`), como o `success.png` do gerador anterior. Inclui timeouts do cliente como
+falhas, exclui iterações não iniciadas do denominador e não mede uptime nem a
+conclusão das operações assíncronas de negócio. Se não houve requisições
+observadas, a disponibilidade é indefinida, não 100%.
+
+O throughput distingue disparos/s solicitados, disparos/s efetivos, respostas/s
+totais (inclusive falhas) e HTTP 201/s. As respostas usam o tempo de observação
+incluindo drenagem. O gerador antigo normalizava sucessos pela duração nominal;
+por isso essa curva antiga pode diferir de `accepted_rps`. Para reproduzir o
+valor nominal a partir das tabelas, use `accepted / duration_s`.
+
+A latência possui painéis separados para todas as respostas e somente HTTP 201,
+com média, p95 e p99 em segundos. A linha da média também é a mediana das médias
+individuais das repetições; não é uma média global. Para tabelas antigas sem a
+coluna de média, `--plots-only` recupera esses valores dos pequenos JSONs de cada
+etapa. Se eles não estiverem disponíveis, a curva de média é omitida; ela nunca é
+estimada a partir dos percentis.
+
+O mapa de calor mantém os números de repetição em ordem numérica para verificar
+se as primeiras execuções diferem das últimas. Células cinzas indicam dados
+ausentes ou percentis indefinidos, por exemplo quando não houve HTTP 201. O
+resumo `by_rate.csv` inclui número de valores válidos, mínimo, P25, mediana, P75 e
+máximo de cada métrica por nível. Os detalhes em `timeline_by_rate/` e
+`pool_by_rate/` evitam comprimir horas de coleta num único gráfico; `r1`, `r2`,
+etc. identificam as repetições. Latências HTTP/SQL são exibidas em segundos; event
+loop permanece em milissegundos. As tabelas mantêm as unidades dos seus cabeçalhos.
+
+`--plots-only` preserva `levels.csv`, `windows.csv` e os resultados brutos; gera
+`by_rate.csv` e regrava as figuras. Ainda lê `application.log` para os gráficos do
+pool, guardando somente os campos necessários. Esse modo usa as janelas já
+calculadas e não aceita alterações de `--window-seconds` ou `--settling-seconds`.
 
 `AUTO_PLOT=0` desativa os gráficos automáticos. `PLOT_PYTHON` seleciona outro
 interpretador. O analisador regrava apenas `analysis/`; preserva os dados brutos.

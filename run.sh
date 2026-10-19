@@ -5,11 +5,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${1:-}" == --help ]]; then
   cat <<'HELP'
 Usage: [RUN_ID=vm-pilot-01] [RATES=1,2,5,10,15,20,30,40] bash run.sh
+Example: RUN_ID=vm-pilot-5reps REPETITIONS=5 bash run.sh
 Starts the PostgreSQL distributed baseline, seeds an empty catalog, warms up,
 and measures ascending constant-arrival-rate plateaus without resetting volumes.
 Defaults: DURATION=3m WARMUP_DURATION=1m WARMUP_RATE=1 REPETITIONS=1
           SETTLING_SECONDS=30 COOLDOWN_SECONDS=30 RECOVERY_TIMEOUT_SECONDS=60
           DB_DIAGNOSTICS=1 COLLECT_HOST=1 AUTO_PLOT=1 SEED_DATA=auto
+REPETITIONS repeats each rate before advancing, e.g. rate1_run1, rate1_run2,
+then rate2_run1, rate2_run2. DURATION applies to each repetition; warmup runs once.
+Cooldown and pool recovery run between repetitions. Each has its own CSV/JSON.
 PRE_ALLOCATED_VUS defaults to 25 * highest RATE (20 s HTTP timeout + headroom).
 MAX_VUS defaults to PRE_ALLOCATED_VUS, avoiding runtime VU allocation by default.
 PLOT_PYTHON can select a Python environment with matplotlib. Otherwise summaries
@@ -130,7 +134,7 @@ mark() {
   printf '{"phase":"%s","timestamp":"%s"}\n' "$phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$OUT/phases.jsonl"
   echo "[pilot] $phase"
 }
-echo "[pilot] Output: $OUT; rates=$RATES; duration=$DURATION; VUs=$PRE_ALLOCATED_VUS/$MAX_VUS"
+echo "[pilot] Output: $OUT; rates=$RATES; repetitions=$REPETITIONS per rate; duration=$DURATION per repetition; VUs=$PRE_ALLOCATED_VUS/$MAX_VUS"
 mark metadata
 git -C "$ROOT_DIR" rev-parse HEAD >"$OUT/git-head.txt" 2>/dev/null || true
 "${COMPOSE[@]}" config >"$OUT/compose-resolved.yaml"
@@ -263,6 +267,7 @@ run_stage warmup "$WARMUP_RATE" "$WARMUP_DURATION" 0 warmup
 recover
 for rate in "${rates[@]}"; do
   for ((repetition=1; repetition<=REPETITIONS; repetition++)); do
+    echo "[pilot] Rate=$rate requests/s; repetition=$repetition/$REPETITIONS"
     run_stage "rate${rate}_run${repetition}" "$rate" "$DURATION" "$repetition" benchmark
     recover
   done

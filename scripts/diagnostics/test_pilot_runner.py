@@ -1,5 +1,6 @@
 """Run root run.sh with fake tools; no Docker, DB or actual load."""
 import json
+import csv
 import os
 from pathlib import Path
 import shutil
@@ -103,6 +104,29 @@ with path.with_suffix('.csv').open('w', newline='') as stream:
         self.assertEqual(status['phase'], 'startup')
         self.assertEqual(status['exitCode'], 42)
         self.assertTrue((self.output / 'logs/startup.log').exists())
+
+    def test_repetitions_keep_order_and_separate_results_with_one_warmup_and_build(self):
+        result = self.run_runner(REPETITIONS='3')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        phases = [json.loads(line)['phase'] for line in (self.output / 'phases.jsonl').read_text().splitlines()]
+        expected = [f'rate{rate}_run{rep}' for rate in (1, 2) for rep in (1, 2, 3)]
+        self.assertEqual([p for p in phases if p.startswith('rate')], expected)
+        self.assertEqual(phases.count('warmup'), 1)
+        self.assertEqual(phases.count('recovery'), 7)  # warmup and all six measurements
+        for stage in expected:
+            self.assertTrue((self.output / f'{stage}.csv').exists())
+            summary = json.loads((self.output / f'{stage}.json').read_text())
+            self.assertEqual(summary['repetition'], int(stage.rsplit('run', 1)[1]))
+            self.assertEqual((self.output / f'{stage}.exit-code.txt').read_text().strip(), '0')
+        metadata = json.loads((self.output / 'metadata.json').read_text())
+        self.assertEqual(metadata['environment']['REPETITIONS'], '3')
+        with (self.output / 'analysis/levels.csv').open() as stream:
+            levels = list(csv.DictReader(stream))
+        self.assertEqual(len(levels), 7)
+        self.assertEqual({r['stage'] for r in levels}, {'warmup', *expected})
+        calls = [json.loads(line) for line in (self.root / 'docker-calls.jsonl').read_text().splitlines()]
+        self.assertEqual(sum('build' in call for call in calls), 1)
+        self.assertFalse(any('down' in call or '--volumes' in call for call in calls))
 
     def test_k6_failure_stops_before_next_plateau(self):
         result = self.run_runner(FAKE_K6_EXIT='99')

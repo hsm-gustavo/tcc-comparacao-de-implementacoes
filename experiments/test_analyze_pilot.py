@@ -1,11 +1,13 @@
 """Small fixtures exercise measurement semantics, not the application."""
 import csv
+import importlib.util
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from analyze_pilot import analyze_stage, percentile
+from analyze_pilot import analyze_stage, enrich_http_metrics, measured_stages, percentile, plot, read_table, summarize_repetitions, write_csv
 
 
 class AnalyzePilotTest(unittest.TestCase):
@@ -46,6 +48,8 @@ class AnalyzePilotTest(unittest.TestCase):
         self.assertAlmostEqual(row['started_rps'], 3 / 30)
         self.assertEqual(row['successful_p50_ms'], 200)
         self.assertEqual(row['p50_ms'], 100)
+        self.assertAlmostEqual(row['latency_mean_ms'], 134)
+        self.assertEqual(row['successful_latency_mean_ms'], 200)
         self.assertEqual(row['tail_response_count'], 1)  # excludes settling and drain
         self.assertEqual(row['tail_accepted_rps'], 0)
         self.assertIsNone(row['tail_successful_p95_ms'])
@@ -68,6 +72,78 @@ class AnalyzePilotTest(unittest.TestCase):
     def test_percentiles_are_interpolated_from_samples_and_empty_is_null(self):
         self.assertEqual(percentile([100, 300], .95), 290)
         self.assertIsNone(percentile([], .95))
+
+    def test_repetition_summary_keeps_stage_percentiles_and_excludes_warmup_and_incomplete(self):
+        row, _ = self.analyze()
+        other = dict(row, repetition=2, stage='rate2_run2', successful_p95_ms=1000)
+        warmup = dict(row, phase='warmup', successful_p95_ms=100000)
+        incomplete = dict(row, complete=False, successful_p95_ms=100000)
+        summary = summarize_repetitions([row, other, warmup, incomplete])
+        value = next(r for r in summary if r['metric'] == 'successful_p95_ms')
+        self.assertEqual(value['repetitions'], 2)
+        self.assertEqual(value['valid_values'], 2)
+        self.assertEqual(value['median'], 645)  # median of stage p95s 290 and 1000
+        self.assertEqual(value['p25'], 467.5)
+        self.assertEqual(value['p75'], 822.5)
+
+    def test_missing_success_percentiles_remain_missing_in_summary(self):
+        row, _ = self.analyze()
+        row['successful_p95_ms'] = None
+        value = next(r for r in summarize_repetitions([row]) if r['metric'] == 'successful_p95_ms')
+        self.assertEqual(value['valid_values'], 0)
+        self.assertIsNone(value['median'])
+        self.assertIsNone(value['min'])
+
+    def test_cached_tables_restore_false_booleans_nulls_and_preserve_status_json(self):
+        row, _ = self.analyze()
+        row.update(complete=False, successful_p95_ms=None)
+        path = self.path.parent / 'levels.csv'
+        write_csv(path, [row])
+        restored = read_table(path)[0]
+        self.assertEqual(restored, row)
+        self.assertEqual(measured_stages([restored]), [])
+
+    def test_repetitions_sort_numerically(self):
+        row, _ = self.analyze()
+        stages = [dict(row, repetition=n) for n in (20, 1, 10, 2)]
+        self.assertEqual([r['repetition'] for r in measured_stages(stages)], [1, 2, 10, 20])
+
+    def test_availability_uses_observed_requests_including_failures_but_not_dropped(self):
+        row, _ = self.analyze()
+        enriched = enrich_http_metrics([row])[0]
+        self.assertAlmostEqual(enriched['availability_pct'], 100 * 2 / 3)
+        self.assertNotIn('availability_pct', row)
+        self.assertIsNone(enrich_http_metrics([dict(row, accepted=0, responses=0)])[0]['availability_pct'])
+        self.assertEqual(enrich_http_metrics([dict(row, accepted=0)])[0]['availability_pct'], 0)
+
+    def test_cached_means_are_backfilled_from_summary_not_estimated_from_percentiles(self):
+        row, _ = self.analyze()
+        del row['latency_mean_ms'], row['successful_latency_mean_ms']
+        self.path.write_text(json.dumps({'latency_mean_ms': 134, 'successful_latency_mean_ms': 200}))
+        enriched = enrich_http_metrics([row], self.path.parent)[0]
+        self.assertEqual(enriched['latency_mean_ms'], 134)
+        self.assertEqual(enriched['successful_latency_mean_ms'], 200)
+        self.assertIsNone(enrich_http_metrics([row])[0]['latency_mean_ms'])
+
+    @unittest.skipUnless(importlib.util.find_spec('matplotlib'), 'optional matplotlib is not installed')
+    def test_throughput_chart_scale_includes_highest_requested_rate(self):
+        row, windows = self.analyze()
+        high = dict(row, stage='rate40_run1', rate=40, start_epoch=1100,
+                    started_rps=40, response_rps=39, accepted_rps=38)
+        rows = enrich_http_metrics([row, high])
+        root = self.path.parent
+        (root / 'analysis').mkdir()
+        saved = {}
+
+        def capture(figure, path, **kwargs):
+            if path.name == 'throughput.png':
+                saved['limits'] = figure.axes[0].get_ylim()
+
+        with patch.dict('os.environ', {'MPLCONFIGDIR': str(root / 'analysis/.matplotlib')}), \
+                patch('matplotlib.figure.Figure.savefig', capture):
+            plot(root, rows, windows)
+        self.assertEqual(saved['limits'][0], 0)
+        self.assertGreater(saved['limits'][1], 40)
 
 
 if __name__ == '__main__':

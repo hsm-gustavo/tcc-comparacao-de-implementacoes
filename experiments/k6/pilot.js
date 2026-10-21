@@ -108,7 +108,10 @@ export default function (data) {
     quantity: 1,
     amount: product.price,
   }), {
-    headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId },
+    headers: {
+      'Content-Type': 'application/json', 'X-Request-Id': requestId,
+      'X-Pilot-Stage': data.runId,
+    },
     timeout: '20s',
     redirects: 0,
     responseCallback: http.expectedStatuses(201),

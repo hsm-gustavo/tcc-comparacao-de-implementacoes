@@ -53,6 +53,17 @@ type Hold = {
   query?: { started: number; category: string };
 };
 
+type PilotPoolStats = {
+  stage: string;
+  requests: number;
+  acquired: number;
+  acquireFailures: number;
+  released: number;
+  removedWithoutRelease: number;
+  holdMsTotal: number;
+  lastReleaseEpochMs: number | null;
+};
+
 function queryCategory(sql: string): string {
   if (sql.startsWith('INSERT INTO "orders"')) return 'INSERT order';
   if (sql.startsWith('INSERT INTO "order_items"')) return 'INSERT order_item';
@@ -86,8 +97,43 @@ export class DiagnosticsService implements OnModuleInit, OnModuleDestroy {
   private previousTime = performance.now();
   private previousCpu = process.cpuUsage();
   private skippedWindows = 0;
+  // Deltas by pilot cohort, retained across skipped stdout windows. No client,
+  // request or SQL values are retained here; at most one entry per stage/window.
+  private readonly pilotStages = new Map<string, PilotPoolStats>();
 
   constructor(private readonly dataSource: DataSource) {}
+
+  recordPilotRequest(stage?: string): string | undefined {
+    const prefix = `${process.env.RUN_ID}-`;
+    if (
+      !process.env.RUN_ID ||
+      !stage?.startsWith(prefix) ||
+      !/^(warmup|rate[1-9][0-9]*_run[1-9][0-9]*)$/.test(
+        stage.slice(prefix.length),
+      )
+    )
+      return undefined;
+    this.pilotStats(stage).requests++;
+    return stage;
+  }
+
+  private pilotStats(stage: string): PilotPoolStats {
+    let stats = this.pilotStages.get(stage);
+    if (!stats) {
+      stats = {
+        stage,
+        requests: 0,
+        acquired: 0,
+        acquireFailures: 0,
+        released: 0,
+        removedWithoutRelease: 0,
+        holdMsTotal: 0,
+        lastReleaseEpochMs: null,
+      };
+      this.pilotStages.set(stage, stats);
+    }
+    return stats;
+  }
 
   private readonly subscriber: EntitySubscriberInterface = {
     beforeQuery: (event: BeforeQueryEvent<unknown>) => {
@@ -167,22 +213,35 @@ export class DiagnosticsService implements OnModuleInit, OnModuleDestroy {
       delivered: (client, context) => {
         const hold = this.clients.get(client);
         if (hold) hold.context = context;
+        if (context.pilotStage) this.pilotStats(context.pilotStage).acquired++;
       },
       release: (_error, client) => {
         const hold = this.clients.get(client);
         if (!hold) return;
-        this.hold.record(performance.now() - hold.started);
+        const now = performance.now();
+        const durationMs = now - hold.started;
+        this.hold.record(durationMs);
+        if (hold.context.pilotStage) {
+          const stats = this.pilotStats(hold.context.pilotStage);
+          stats.released++;
+          stats.holdMsTotal += durationMs;
+          stats.lastReleaseEpochMs = performance.timeOrigin + now;
+        }
         this.active.delete(hold.id);
         this.clients.delete(client);
       },
       remove: (client) => {
         const hold = this.clients.get(client);
+        if (hold?.context.pilotStage)
+          this.pilotStats(hold.context.pilotStage).removedWithoutRelease++;
         if (hold) this.active.delete(hold.id);
         this.clients.delete(client);
       },
       acquisition: (durationMs, error, context) => {
         this.acquire.record(durationMs, !error);
         if (error) {
+          if (context.pilotStage)
+            this.pilotStats(context.pilotStage).acquireFailures++;
           this.errorCount++;
           if (this.errors.length < 5)
             this.errors.push({
@@ -242,6 +301,7 @@ export class DiagnosticsService implements OnModuleInit, OnModuleDestroy {
     );
     // One bounded JSON line per window. Never accumulate stdout writes if the
     // Docker logger/pipe cannot keep up; loss is visible in the next window.
+    const connectionHold = this.hold.snapshot();
     const record = {
       type: 'db_diagnostic_sample',
       windowMs,
@@ -252,7 +312,11 @@ export class DiagnosticsService implements OnModuleInit, OnModuleDestroy {
         waiting: pool.waitingCount,
       },
       connectionAcquire: this.acquire.snapshot(),
-      connectionHold: this.hold.snapshot(),
+      connectionHold,
+      // Arithmetic mean of completed checkouts in this window, not HTTP latency
+      // or time waiting for a connection. Null when no connection was returned.
+      pool_hold_ms: connectionHold.avgMs,
+      poolHoldByStage: Array.from(this.pilotStages.values()),
       queryDuration: this.queryDuration.snapshot(),
       queryDurations,
       holders,
@@ -282,6 +346,7 @@ export class DiagnosticsService implements OnModuleInit, OnModuleDestroy {
     if (process.stdout.writableNeedDrain) this.skippedWindows++;
     else {
       this.write(record);
+      this.pilotStages.clear();
       this.skippedWindows = 0;
     }
     this.errors = [];

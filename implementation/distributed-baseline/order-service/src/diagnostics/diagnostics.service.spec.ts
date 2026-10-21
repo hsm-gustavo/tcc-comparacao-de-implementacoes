@@ -21,6 +21,15 @@ type Sample = {
   pool: { total: number; idle: number; inUse: number; waiting: number };
   connectionAcquire: Summary;
   connectionHold: Summary;
+  pool_hold_ms: number | null;
+  poolHoldByStage: Array<{
+    stage: string;
+    requests: number;
+    acquired: number;
+    released: number;
+    acquireFailures: number;
+    holdMsTotal: number;
+  }>;
   queryDuration: Summary;
   queryDurations: Record<string, Summary>;
   holders: Record<string, unknown>[];
@@ -120,6 +129,9 @@ describe('diagnostics with real pool/TypeORM and in-memory clients', () => {
     client[1]();
     service.sample();
     expect(records.at(-1)!.connectionHold.count).toBe(1);
+    expect(records.at(-1)!.pool_hold_ms).toBe(
+      records.at(-1)!.connectionHold.avgMs,
+    );
     expect(records.at(-1)!.holders).toEqual([]);
   });
 
@@ -199,5 +211,48 @@ describe('diagnostics with real pool/TypeORM and in-memory clients', () => {
     }
     service.sample();
     expect(records.at(-1)!.skippedWindows).toBe(1);
+  });
+
+  it('counts multiple checkouts per pilot request, retains skipped deltas, and excludes untagged work', async () => {
+    service.onModuleInit();
+    expect(service.recordPilotRequest('foreign-rate100_run1')).toBeUndefined();
+    const stage = service.recordPilotRequest('unit-run-rate100_run1');
+    expect(stage).toBe('unit-run-rate100_run1');
+    await diagnosticContext.run({ pilotStage: stage }, async () => {
+      const first = await checkout();
+      const failure = checkout();
+      await expect(failure).rejects.toThrow('timeout exceeded');
+      first[1]();
+      const second = await checkout();
+      second[1]();
+    });
+    const untagged = await checkout();
+    untagged[1]();
+    const state = (
+      process.stdout as unknown as { _writableState: { needDrain: boolean } }
+    )._writableState;
+    const previous = state.needDrain;
+    try {
+      state.needDrain = true;
+      service.sample();
+      expect(records).toHaveLength(1);
+    } finally {
+      state.needDrain = previous;
+    }
+    service.sample();
+    const sample = records.at(-1)!;
+    // The general window histogram was skipped/reset, but cohort counters survive.
+    expect(sample.pool_hold_ms).toBeNull();
+    expect(sample.poolHoldByStage).toHaveLength(1);
+    expect(sample.poolHoldByStage[0]).toMatchObject({
+      stage,
+      requests: 1,
+      acquired: 2,
+      released: 2,
+      acquireFailures: 1,
+    });
+    expect(sample.poolHoldByStage[0].holdMsTotal).toBeGreaterThan(0);
+    service.sample();
+    expect(records.at(-1)!.poolHoldByStage).toEqual([]);
   });
 });

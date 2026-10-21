@@ -20,6 +20,86 @@ stacks automaticamente.
 
 ## Executar
 
+### Lei de Little: 100 requisições/s, 20 repetições de 3 minutos
+
+Na raiz do checkout atualizado, com os mesmos pré-requisitos do piloto:
+
+```bash
+sudo RUN_ID=vm-pg-little-100rps-20reps-01 bash run-little.sh
+```
+
+O script usa `run.sh`, com `RATES=100`, `REPETITIONS=20`, `DURATION=3m` e
+`DB_DIAGNOSTICS=1`. O aquecimento, cooldown, recuperação, coletores e gráficos
+continuam sendo os do piloto. São 60 minutos de disparos medidos, aproximadamente
+1h12 com aquecimento e cooldown, mais build, drenagem e esperas de recuperação.
+Repetições/duração podem ser substituídas pelas mesmas variáveis do piloto.
+O limite de VUs continua sendo calculado pelo runner: 2500 para 100 disparos/s.
+Não há alteração de pool, timeouts, sockets, queries ou transações.
+
+Durante a execução, `application.log` recebe `pool_hold_ms` em cada amostra
+diagnóstica de aproximadamente um segundo: média de posse das conexões devolvidas
+na janela, desde `pg.Pool.acquire` até `pg.Pool.release` do pool real do TypeORM.
+É `null` quando nenhuma conexão foi devolvida. Exclui espera por aquisição e
+inclui todas as queries, COMMIT e demais esperas enquanto o client está adquirido.
+Os percentis existentes continuam em `connectionHold`; para Little usa-se média.
+
+O header diagnóstico `X-Pilot-Stage` associa cada pedido à sua repetição. Os
+contadores `poolHoldByStage` registram pedidos recebidos, aquisições entregues,
+falhas de aquisição, devoluções e soma dos tempos de posse (`holdMsTotal`). São
+deltas agregados, sem log por aquisição/query e sem manter objetos de requisição.
+Se stdout estiver sob backpressure, esses deltas ficam acumulados até a próxima
+publicação. Devoluções tardias continuam na repetição original, mesmo depois de
+timeout HTTP. O overhead adicional é um header e contadores/somas em memória,
+mais alguns campos por segundo; isso também deve ser mantido igual nas comparações.
+
+Ao final, o terminal mostra cada repetição e o resultado agregado. Os relatórios
+ficam em `experiments/datasets/pilot/<RUN_ID>/analysis/little.json` e `little.csv`.
+Para recalcular sem executar carga:
+
+```bash
+python3 experiments/analyze_little.py \
+  experiments/datasets/pilot/vm-pg-little-100rps-20reps-01 \
+  --target-rps 100 --expected-repetitions 20
+```
+
+O relatório diferencia três cálculos:
+
+- `C_single_checkout_assumption = 100 × pool_hold_ms / 1000`: expressão direta
+  solicitada, válida para conexões ocupadas se houver exatamente um checkout por pedido.
+- `C_at_target_request_rate = 100 × pool_hold_per_request_ms / 1000`, onde
+  `pool_hold_per_request_ms = soma de TODOS os tempos de posse / pedidos recebidos`.
+  É equivalente a `100 × checkouts/pedido × posse média por checkout / 1000`.
+  Considera que um pedido pode adquirir/liberar a conexão várias vezes. Uma aquisição
+  pode executar várias queries; o fator é por checkout, não por query.
+- `C_observed = lambda_pool_observed_per_s × pool_hold_ms / 1000`: utiliza a taxa
+  efetiva de checkouts devolvidos, considerando a duração observada e a drenagem,
+  inclusive devoluções posteriores ao fim das respostas HTTP. Não substitui a taxa
+  de disparos de requisições pela vazão de respostas bem-sucedidas.
+
+Exemplo: posse média de 50 ms e três checkouts por pedido resultam em
+`100 × 3 × 0,050 = 15` conexões ocupadas em média; usar só `100 × 0,050 = 5`
+omitaria duas visitas ao pool. A média agregada é ponderada pelo número de
+checkouts, não uma média das médias/percentis das janelas de um segundo.
+
+Os cálculos incluem a acomodação inicial e a drenagem de cada repetição, excluindo
+warmup, setup e os intervalos de recuperação. Não certificam regime estacionário.
+Little requer taxa e tempo referentes ao mesmo sistema/população; veja
+[Kim e Whitt, sobre aplicação e validação da Lei de Little](https://www.columbia.edu/~ww2040/Kim_Whitt_PEIS_2013.pdf).
+`C` é ocupação **média**, não tamanho mínimo seguro do pool. Falhas e timeouts
+podem reduzir o número de checkouts realizados por pedido; projetar esse perfil
+para 100/s não comprova capacidade para 100 pedidos/s com sucesso. O relatório
+sinaliza falhas, chegadas descartadas, divergência entre pedidos disparados e
+recebidos, clientes não devolvidos/removidos e repetições incompletas. C ausente
+não é substituído por zero quando faltam os contadores.
+
+O coletor PostgreSQL mantém seu `statement_timeout` de 2s, exclusivo da sessão
+observadora. Se falhar antes do benchmark, o runner interrompe e nenhum C é
+calculado. Para falhas durante a carga, os resultados disponíveis são parciais e
+o status de falha do piloto é preservado. Esses relatórios requerem a imagem
+reconstruída com a nova instrumentação; logs antigos não têm contadores por coorte.
+
+### Piloto com vários níveis
+
 Na raiz do checkout da VM, com Docker + Compose, k6, Python 3, curl e timeout
 disponíveis. O `sysstat` é opcional para vmstat/pidstat/iostat. Prepare o ambiente
 Python antes da medição para gerar gráficos automaticamente:

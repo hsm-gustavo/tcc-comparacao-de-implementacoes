@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 export type DiagnosticContext = {
   requestId?: string;
+  pilotStage?: string;
   orderId?: string;
   operation?: string;
 };

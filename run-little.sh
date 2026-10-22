@@ -6,6 +6,7 @@ if [[ "${1:-}" == --help ]]; then
   echo 'Usage: sudo RUN_ID=vm-pg-little-01 bash run-little.sh'
   echo 'Defaults: RATES=100 (fixed), REPETITIONS=20, DURATION=3m, DB_DIAGNOSTICS=1 (fixed).'
   echo 'Other pilot variables are inherited from run.sh. No pool/timeout/socket changes.'
+  echo 'K6_CSV_STORAGE=tmpfs keeps CSVs in RAM during all repetitions; exported before charts/Little report.'
   exit 0
 fi
 (( $# == 0 )) || { echo 'Use bash run-little.sh --help' >&2; exit 1; }

@@ -11,6 +11,7 @@ and measures ascending constant-arrival-rate plateaus without resetting volumes.
 Defaults: DURATION=3m WARMUP_DURATION=1m WARMUP_RATE=1 REPETITIONS=1
           SETTLING_SECONDS=30 COOLDOWN_SECONDS=30 RECOVERY_TIMEOUT_SECONDS=60
           DB_DIAGNOSTICS=1 COLLECT_HOST=1 AUTO_PLOT=1 SEED_DATA=auto
+          K6_CSV_STORAGE=disk K6_CSV_TMPFS_ROOT=/dev/shm
 REPETITIONS repeats each rate before advancing, e.g. rate1_run1, rate1_run2,
 then rate2_run1, rate2_run2. DURATION applies to each repetition; warmup runs once.
 Cooldown and pool recovery run between repetitions. Each has its own CSV/JSON.
@@ -18,6 +19,10 @@ PRE_ALLOCATED_VUS defaults to 25 * highest RATE (20 s HTTP timeout + headroom).
 MAX_VUS defaults to PRE_ALLOCATED_VUS, avoiding runtime VU allocation by default.
 PLOT_PYTHON can select a Python environment with matplotlib. Otherwise summaries
 are still generated and charts can be generated manually later.
+K6_CSV_STORAGE=tmpfs stages ALL k6 CSVs in memory until load and recovery end,
+then copies them to the usual results directory before analysis/charts.
+K6_CSV_TMPFS_ROOT must be a writable tmpfs mount (findmnt is required).
+CSV files accumulate for the entire run: reserve enough free tmpfs/RAM space.
 Existing containers/volumes and previous results are never deleted.
 HELP
   exit 0
@@ -31,6 +36,8 @@ export SETTLING_SECONDS="${SETTLING_SECONDS:-30}"
 export COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-30}"
 export RECOVERY_TIMEOUT_SECONDS="${RECOVERY_TIMEOUT_SECONDS:-60}"
 export DB_DIAGNOSTICS="${DB_DIAGNOSTICS:-1}" COLLECT_HOST="${COLLECT_HOST:-1}"
+export K6_CSV_STORAGE="${K6_CSV_STORAGE:-disk}"
+export K6_CSV_TMPFS_ROOT="${K6_CSV_TMPFS_ROOT:-/dev/shm}"
 export SEED_DATA="${SEED_DATA:-auto}" BASE_URL=http://127.0.0.1:8000 WAREHOUSE_PREFIX=/warehouse
 export TZ=UTC
 export STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -63,6 +70,17 @@ for name in DB_DIAGNOSTICS COLLECT_HOST AUTO_PLOT; do
   [[ "${!name}" =~ ^[01]$ ]] || fail "$name must be 0 or 1"
 done
 [[ "$SEED_DATA" =~ ^(auto|0|1)$ ]] || fail 'SEED_DATA must be auto, 0 or 1'
+[[ "$K6_CSV_STORAGE" =~ ^(disk|tmpfs)$ ]] || fail 'K6_CSV_STORAGE must be disk or tmpfs'
+if [[ "$K6_CSV_STORAGE" == tmpfs ]]; then
+  for tool in findmnt mktemp cp rm rmdir; do
+    command -v "$tool" >/dev/null || fail "Missing tmpfs dependency: $tool"
+  done
+  [[ -d "$K6_CSV_TMPFS_ROOT" && -w "$K6_CSV_TMPFS_ROOT" && -x "$K6_CSV_TMPFS_ROOT" ]] \
+    || fail "K6_CSV_TMPFS_ROOT is not a writable directory: $K6_CSV_TMPFS_ROOT"
+  K6_CSV_TMPFS_ROOT="$(cd "$K6_CSV_TMPFS_ROOT" && pwd -P)"
+  [[ "$(findmnt -n -T "$K6_CSV_TMPFS_ROOT" -o FSTYPE)" == tmpfs ]] \
+    || fail "K6_CSV_TMPFS_ROOT must be on tmpfs: $K6_CSV_TMPFS_ROOT"
+fi
 python3 - "$DURATION" "$WARMUP_DURATION" "$SETTLING_SECONDS" <<'PY'
 import re, sys
 units = {'s': 1, 'm': 60, 'h': 3600}
@@ -84,20 +102,45 @@ umask 077
 mkdir -p "$(dirname "$OUT")"
 mkdir "$OUT" "$OUT/logs"
 children=()
+CSV_DIR="$OUT"
+csv_staging=''
+csv_export_status=not_needed
 phase=metadata
 current_log=''
 plots_status=not_requested
+export_csv() {
+  local file
+  echo "[pilot] Exporting CSVs after load/recovery: $csv_staging -> $OUT"
+  # Keep every RAM original if any copy fails. No fallback to disk during load.
+  for file in "$csv_staging"/*.csv; do
+    [[ -f "$file" ]] || continue
+    cp -- "$file" "$OUT/${file##*/}" || return 1
+  done
+  for file in "$csv_staging"/*.csv; do
+    [[ -f "$file" ]] || continue
+    rm -- "$file" || return 1
+  done
+  rmdir -- "$csv_staging" || return 1
+  csv_staging=''
+  csv_export_status=exported
+}
 finish() {
   local status=$? pid
   trap - EXIT INT TERM
   set +e
   for pid in "${children[@]}"; do kill -TERM "$pid" 2>/dev/null; done
   for pid in "${children[@]}"; do wait "$pid" 2>/dev/null; done
+  # Only export once every k6/collector child has stopped, including on failure.
+  if [[ -n "$csv_staging" ]] && ! export_csv; then
+    csv_export_status=failed
+    echo "[pilot] CSV export failed; remaining originals preserved in RAM: $csv_staging" >&2
+    if (( status == 0 )); then status=1; phase=csv_export; fi
+  fi
   if (( status != 0 )); then
     "${COMPOSE[@]}" ps --all >"$OUT/logs/final-containers.txt" 2>&1
     "${COMPOSE[@]}" logs --no-color --tail 100 >"$OUT/logs/failure.log" 2>&1
   fi
-  if compgen -G "$OUT/rate*_run*.json" >/dev/null; then
+  if [[ "$csv_export_status" != failed ]] && compgen -G "$OUT/rate*_run*.json" >/dev/null; then
     plots_status=summary_only
     python3 "$ROOT_DIR/experiments/analyze_pilot.py" "$OUT" --no-plots \
       >"$OUT/analysis.log" 2>&1 || plots_status=analysis_failed
@@ -112,11 +155,14 @@ finish() {
       if (( $? == 0 )); then plots_status=generated; else plots_status=plots_pending; fi
     fi
   fi
-  printf '{"runId":"%s","exitCode":%d,"phase":"%s","plots":"%s"}\n' \
-    "$RUN_ID" "$status" "$phase" "$plots_status" >"$OUT/status.json"
+  printf '{"runId":"%s","exitCode":%d,"phase":"%s","plots":"%s","csvStorage":"%s","csvExport":"%s"}\n' \
+    "$RUN_ID" "$status" "$phase" "$plots_status" "$K6_CSV_STORAGE" "$csv_export_status" >"$OUT/status.json"
   if (( EUID == 0 )) && [[ "${SUDO_UID:-}" =~ ^[0-9]+$ && "${SUDO_GID:-}" =~ ^[0-9]+$ ]]; then
     chown -- "$SUDO_UID:$SUDO_GID" "$(dirname "$OUT")"
     chown -R -P --no-dereference -- "$SUDO_UID:$SUDO_GID" "$OUT"
+    if [[ -n "$csv_staging" && -d "$csv_staging" ]]; then
+      chown -R -P --no-dereference -- "$SUDO_UID:$SUDO_GID" "$csv_staging"
+    fi
   fi
   echo "[pilot] Results: $OUT (exit=$status, phase=$phase, plots=$plots_status)"
   echo '[pilot] Containers and volumes preserved. HTTP success must be assessed in the results.'
@@ -129,25 +175,43 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [[ "$K6_CSV_STORAGE" == tmpfs ]]; then
+  csv_staging="$(mktemp -d "$K6_CSV_TMPFS_ROOT/k6-pilot.$RUN_ID.XXXXXX")"
+  CSV_DIR="$csv_staging"
+  csv_export_status=pending
+  python3 - "$CSV_DIR" <<'PY'
+import os, sys
+stats = os.statvfs(sys.argv[1])
+free_bytes = stats.f_bavail * stats.f_frsize
+if free_bytes <= 0:
+    sys.exit('No free space on CSV tmpfs')
+print(f'[pilot] CSV tmpfs: {sys.argv[1]}; available={free_bytes / 1024**2:.0f} MiB (not reserved)')
+PY
+fi
 mark() {
   phase="$1"
   printf '{"phase":"%s","timestamp":"%s"}\n' "$phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$OUT/phases.jsonl"
   echo "[pilot] $phase"
 }
 echo "[pilot] Output: $OUT; rates=$RATES; repetitions=$REPETITIONS per rate; duration=$DURATION per repetition; VUs=$PRE_ALLOCATED_VUS/$MAX_VUS"
+echo "[pilot] CSV storage during load: $K6_CSV_STORAGE ($CSV_DIR)"
 mark metadata
 git -C "$ROOT_DIR" rev-parse HEAD >"$OUT/git-head.txt" 2>/dev/null || true
 "${COMPOSE[@]}" config >"$OUT/compose-resolved.yaml"
 k6 version >"$OUT/logs/k6-version.txt"
 { uname -a; command -v lscpu >/dev/null && lscpu; free -m; df -hT /; } >"$OUT/host-info.txt" 2>&1 || true
-python3 - "$ROOT_DIR" "$OUT" <<'PY'
+python3 - "$ROOT_DIR" "$OUT" "$CSV_DIR" <<'PY'
 import hashlib, json, os, pathlib, sys
-root, out = map(pathlib.Path, sys.argv[1:])
+root, out, csv_dir = map(pathlib.Path, sys.argv[1:])
 keys = ['RUN_ID','STARTED_AT','RATES','DURATION','WARMUP_DURATION','WARMUP_RATE','REPETITIONS',
         'SETTLING_SECONDS','COOLDOWN_SECONDS','RECOVERY_TIMEOUT_SECONDS',
-        'PRE_ALLOCATED_VUS','MAX_VUS','DB_DIAGNOSTICS','COLLECT_HOST','SEED_DATA']
+        'PRE_ALLOCATED_VUS','MAX_VUS','DB_DIAGNOSTICS','COLLECT_HOST','SEED_DATA',
+        'K6_CSV_STORAGE','K6_CSV_TMPFS_ROOT']
 data = {'architecture': 'distributed-baseline', 'database': 'postgres',
         'environment': {k: os.environ[k] for k in keys},
+        'csvOutput': {'storage': os.environ['K6_CSV_STORAGE'], 'pathDuringLoad': str(csv_dir),
+                      'availableBytesBeforeRun': os.statvfs(csv_dir).f_bavail * os.statvfs(csv_dir).f_frsize,
+                      'exportPolicy': 'Copy tmpfs CSVs only after all load/recovery and child shutdown, before analysis.'},
         'datasetPolicy': 'Reuse volumes; seed only an empty catalog; ascending exploratory sweep without resets.'}
 (out/'metadata.json').write_text(json.dumps(data, indent=2)+'\n')
 files = [root/'run.sh', root/'experiments/k6/pilot.js', root/'experiments/analyze_pilot.py',
@@ -221,7 +285,7 @@ run_stage() {
   current_log="$OUT/logs/${prefix}_k6.log"
   ARCHITECTURE=distributed-baseline RATE="$rate" DURATION="$duration" REPETITION="$repetition" \
   RUN_ID="$RUN_ID-$prefix" PILOT_PHASE="$kind" LOG_ERRORS=false SUMMARY_JSON="$OUT/$prefix.json" \
-    k6 run --out "csv=$OUT/$prefix.csv" "$ROOT_DIR/experiments/k6/pilot.js" >"$current_log" 2>&1 &
+    k6 run --out "csv=$CSV_DIR/$prefix.csv" "$ROOT_DIR/experiments/k6/pilot.js" >"$current_log" 2>&1 &
   local load_pid=$!; children+=("$load_pid")
   while kill -0 "$load_pid" 2>/dev/null; do
     sleep 5

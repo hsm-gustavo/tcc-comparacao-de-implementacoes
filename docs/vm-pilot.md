@@ -20,6 +20,63 @@ stacks automaticamente.
 
 ## Executar
 
+### Experimento A/B: CSV do k6 em disco ou em memória
+
+O padrão continua `K6_CSV_STORAGE=disk`. Para testar somente a interferência
+da gravação do CSV, use `K6_CSV_STORAGE=tmpfs`. Os logs da aplicação, JSONs de
+resumo, instrumentação, coletores, carga, VUs e configurações de banco/HTTP
+permanecem iguais. Não se trata de desligar logs ou métricas.
+
+Na raiz do checkout da VM, para três repetições de 100 disparos/s por três
+minutos, com relatório de Little e os mesmos gráficos:
+
+```bash
+# Baseline: CSV no disco, comportamento anterior.
+sudo RUN_ID=vm-pg-csv-disk-3reps-01 REPETITIONS=3 DURATION=3m \
+  K6_CSV_STORAGE=disk bash run-little.sh
+
+# Experimental: somente o destino do CSV durante a carga muda.
+sudo RUN_ID=vm-pg-csv-tmpfs-3reps-01 REPETITIONS=3 DURATION=3m \
+  K6_CSV_STORAGE=tmpfs bash run-little.sh
+```
+
+Também funciona diretamente com `run.sh`, mantendo os níveis configurados em
+`RATES`. Os comandos não são executados automaticamente pela implementação.
+Controle o estado inicial dos dados entre os grupos A/B e mantenha as demais
+variáveis iguais. O runner continua reutilizando os volumes e não restaura nem
+apaga o banco; executar esses comandos em sequência não garante dados iniciais
+idênticos. Não use resultados de protocolos diferentes como uma única amostra.
+
+No modo `tmpfs`, todos os CSVs, inclusive o aquecimento e todas as repetições,
+ficam em um diretório privado criado sob `/dev/shm`. Pode-se selecionar outro
+diretório com `K6_CSV_TMPFS_ROOT`, mas o runner verifica com `findmnt` que ele
+está em um filesystem `tmpfs`. Um caminho em disco é recusado; não há fallback.
+`findmnt` e os utilitários padrão `mktemp`, `cp`, `rm` e `rmdir` são necessários
+somente nesse modo. Não é preciso configurar ou montar um novo filesystem.
+
+Os arquivos **não são copiados entre repetições**, nem durante o cooldown.
+Depois da última recuperação, o runner encerra os filhos/coletores, copia os
+CSVs para a pasta usual de resultados e só então executa a análise e os gráficos.
+O relatório de Little continua sendo produzido pelo wrapper. Os nomes dos CSVs,
+o formato e os caminhos finais não mudam; nenhuma alteração no analisador é necessária.
+`metadata.json` registra o modo, diretório temporário e espaço disponível antes
+do teste; `status.json` registra `csvStorage` e `csvExport`.
+
+Os CSVs acumulam em memória por toda a execução. O espaço livre é mostrado ao
+iniciar, sem reserva nem garantia de caber o teste completo. Nesta investigação,
+a escrita atribuída ao k6 foi da ordem de 1 GiB nas 20 repetições; reserve margem
+e confira `df -h /dev/shm` e a memória livre antes de usar esse protocolo longo.
+`tmpfs` consome memória e pode usar swap; monitore `si/so` para que a comparação
+continue representando armazenamento em memória. O runner não altera swap.
+
+Em erro ou interrupção normal, após encerrar os filhos, o runner também tenta
+exportar os CSVs parciais e mantém o exit code original. Se a cópia falhar, a
+análise dos CSVs não é executada, o status indica `csvExport=failed` e os originais
+permanecem no diretório em RAM informado no terminal e em `metadata.json`.
+Quando não havia falha anterior, o exit code passa a ser não zero. A pasta
+temporária só é removida após a exportação bem-sucedida. Queda da VM ou `SIGKILL`
+não permitem executar essa recuperação; dados ainda em tmpfs não são persistentes.
+
 ### Lei de Little: 100 requisições/s, 20 repetições de 3 minutos
 
 Na raiz do checkout atualizado, com os mesmos pré-requisitos do piloto:

@@ -20,6 +20,37 @@ stacks automaticamente.
 
 ## Executar
 
+### Permissões dos resultados ao usar sudo
+
+Use `sudo` a partir da sua conta normal, como nos exemplos abaixo. O runner
+identifica essa conta por `SUDO_UID`/`SUDO_GID`, corrige a propriedade dos
+diretórios `experiments`, `experiments/datasets` e `pilot` sem percorrer ensaios
+antigos e, ao encerrar, devolve toda a pasta da execução ao usuário. Isso também
+ocorre em falhas e interrupções tratadas, incluindo a pasta `analysis` e seus
+gráficos e tabelas. A devolução acontece
+depois da carga/análise; durante a execução, arquivos ainda podem exigir `sudo`.
+
+O `umask 077` é mantido: novos diretórios são privados (700) e arquivos privados
+(600). Na versão anterior, `experiments/datasets` podia continuar pertencendo a
+root com modo 700, impedindo acesso mesmo aos resultados com dono correto.
+Uma sessão aberta diretamente como root, sem `SUDO_UID`/`SUDO_GID`, não permite
+identificar o usuário original; prefira os comandos `sudo ... bash run.sh`.
+Queda da VM ou `SIGKILL` não executam a devolução final.
+
+Para recuperar resultados **já existentes**, na raiz do repositório e usando
+sua conta normal, execute uma vez (sem iniciar containers ou carga):
+
+```bash
+sudo chown -- "$(id -u):$(id -g)" experiments
+sudo chmod u+rwx -- experiments
+sudo chown -R -P --no-dereference -- "$(id -u):$(id -g)" experiments/datasets
+sudo chmod -R u+rwX -- experiments/datasets
+```
+
+Esses comandos mudam somente propriedade/acesso, preservando o conteúdo. O
+runner corrige automaticamente as pastas ancestrais e cada **nova** execução;
+não percorre todos os históricos a cada ensaio nem modifica volumes do Docker.
+
 ### Experimento A/B: CSV do k6 em disco ou em memória
 
 O padrão continua `K6_CSV_STORAGE=disk`. Para testar somente a interferência
@@ -28,20 +59,20 @@ resumo, instrumentação, coletores, carga, VUs e configurações de banco/HTTP
 permanecem iguais. Não se trata de desligar logs ou métricas.
 
 Na raiz do checkout da VM, para três repetições de 100 disparos/s por três
-minutos, com relatório de Little e os mesmos gráficos:
+minutos, com geração automática dos gráficos:
 
 ```bash
 # Baseline: CSV no disco, comportamento anterior.
-sudo RUN_ID=vm-pg-csv-disk-3reps-01 REPETITIONS=3 DURATION=3m \
-  K6_CSV_STORAGE=disk bash run-little.sh
+sudo RUN_ID=vm-pg-csv-disk-3reps-01 RATES=100 REPETITIONS=3 DURATION=3m \
+  K6_CSV_STORAGE=disk bash run.sh
 
 # Experimental: somente o destino do CSV durante a carga muda.
-sudo RUN_ID=vm-pg-csv-tmpfs-3reps-01 REPETITIONS=3 DURATION=3m \
-  K6_CSV_STORAGE=tmpfs bash run-little.sh
+sudo RUN_ID=vm-pg-csv-tmpfs-3reps-01 RATES=100 REPETITIONS=3 DURATION=3m \
+  K6_CSV_STORAGE=tmpfs bash run.sh
 ```
 
-Também funciona diretamente com `run.sh`, mantendo os níveis configurados em
-`RATES`. Os comandos não são executados automaticamente pela implementação.
+Use `RATES` para selecionar outros níveis. Os comandos não são executados
+automaticamente pela implementação.
 Controle o estado inicial dos dados entre os grupos A/B e mantenha as demais
 variáveis iguais. O runner continua reutilizando os volumes e não restaura nem
 apaga o banco; executar esses comandos em sequência não garante dados iniciais
@@ -57,8 +88,8 @@ somente nesse modo. Não é preciso configurar ou montar um novo filesystem.
 Os arquivos **não são copiados entre repetições**, nem durante o cooldown.
 Depois da última recuperação, o runner encerra os filhos/coletores, copia os
 CSVs para a pasta usual de resultados e só então executa a análise e os gráficos.
-O relatório de Little continua sendo produzido pelo wrapper. Os nomes dos CSVs,
-o formato e os caminhos finais não mudam; nenhuma alteração no analisador é necessária.
+Os nomes dos CSVs, o formato e os caminhos finais são iguais nos dois modos de
+armazenamento; nenhuma alteração no analisador é necessária.
 `metadata.json` registra o modo, diretório temporário e espaço disponível antes
 do teste; `status.json` registra `csvStorage` e `csvExport`.
 
@@ -77,84 +108,6 @@ Quando não havia falha anterior, o exit code passa a ser não zero. A pasta
 temporária só é removida após a exportação bem-sucedida. Queda da VM ou `SIGKILL`
 não permitem executar essa recuperação; dados ainda em tmpfs não são persistentes.
 
-### Lei de Little: 100 requisições/s, 20 repetições de 3 minutos
-
-Na raiz do checkout atualizado, com os mesmos pré-requisitos do piloto:
-
-```bash
-sudo RUN_ID=vm-pg-little-100rps-20reps-01 bash run-little.sh
-```
-
-O script usa `run.sh`, com `RATES=100`, `REPETITIONS=20`, `DURATION=3m` e
-`DB_DIAGNOSTICS=1`. O aquecimento, cooldown, recuperação, coletores e gráficos
-continuam sendo os do piloto. São 60 minutos de disparos medidos, aproximadamente
-1h12 com aquecimento e cooldown, mais build, drenagem e esperas de recuperação.
-Repetições/duração podem ser substituídas pelas mesmas variáveis do piloto.
-O limite de VUs continua sendo calculado pelo runner: 2500 para 100 disparos/s.
-Não há alteração de pool, timeouts, sockets, queries ou transações.
-
-Durante a execução, `application.log` recebe `pool_hold_ms` em cada amostra
-diagnóstica de aproximadamente um segundo: média de posse das conexões devolvidas
-na janela, desde `pg.Pool.acquire` até `pg.Pool.release` do pool real do TypeORM.
-É `null` quando nenhuma conexão foi devolvida. Exclui espera por aquisição e
-inclui todas as queries, COMMIT e demais esperas enquanto o client está adquirido.
-Os percentis existentes continuam em `connectionHold`; para Little usa-se média.
-
-O header diagnóstico `X-Pilot-Stage` associa cada pedido à sua repetição. Os
-contadores `poolHoldByStage` registram pedidos recebidos, aquisições entregues,
-falhas de aquisição, devoluções e soma dos tempos de posse (`holdMsTotal`). São
-deltas agregados, sem log por aquisição/query e sem manter objetos de requisição.
-Se stdout estiver sob backpressure, esses deltas ficam acumulados até a próxima
-publicação. Devoluções tardias continuam na repetição original, mesmo depois de
-timeout HTTP. O overhead adicional é um header e contadores/somas em memória,
-mais alguns campos por segundo; isso também deve ser mantido igual nas comparações.
-
-Ao final, o terminal mostra cada repetição e o resultado agregado. Os relatórios
-ficam em `experiments/datasets/pilot/<RUN_ID>/analysis/little.json` e `little.csv`.
-Para recalcular sem executar carga:
-
-```bash
-python3 experiments/analyze_little.py \
-  experiments/datasets/pilot/vm-pg-little-100rps-20reps-01 \
-  --target-rps 100 --expected-repetitions 20
-```
-
-O relatório diferencia três cálculos:
-
-- `C_single_checkout_assumption = 100 × pool_hold_ms / 1000`: expressão direta
-  solicitada, válida para conexões ocupadas se houver exatamente um checkout por pedido.
-- `C_at_target_request_rate = 100 × pool_hold_per_request_ms / 1000`, onde
-  `pool_hold_per_request_ms = soma de TODOS os tempos de posse / pedidos recebidos`.
-  É equivalente a `100 × checkouts/pedido × posse média por checkout / 1000`.
-  Considera que um pedido pode adquirir/liberar a conexão várias vezes. Uma aquisição
-  pode executar várias queries; o fator é por checkout, não por query.
-- `C_observed = lambda_pool_observed_per_s × pool_hold_ms / 1000`: utiliza a taxa
-  efetiva de checkouts devolvidos, considerando a duração observada e a drenagem,
-  inclusive devoluções posteriores ao fim das respostas HTTP. Não substitui a taxa
-  de disparos de requisições pela vazão de respostas bem-sucedidas.
-
-Exemplo: posse média de 50 ms e três checkouts por pedido resultam em
-`100 × 3 × 0,050 = 15` conexões ocupadas em média; usar só `100 × 0,050 = 5`
-omitaria duas visitas ao pool. A média agregada é ponderada pelo número de
-checkouts, não uma média das médias/percentis das janelas de um segundo.
-
-Os cálculos incluem a acomodação inicial e a drenagem de cada repetição, excluindo
-warmup, setup e os intervalos de recuperação. Não certificam regime estacionário.
-Little requer taxa e tempo referentes ao mesmo sistema/população; veja
-[Kim e Whitt, sobre aplicação e validação da Lei de Little](https://www.columbia.edu/~ww2040/Kim_Whitt_PEIS_2013.pdf).
-`C` é ocupação **média**, não tamanho mínimo seguro do pool. Falhas e timeouts
-podem reduzir o número de checkouts realizados por pedido; projetar esse perfil
-para 100/s não comprova capacidade para 100 pedidos/s com sucesso. O relatório
-sinaliza falhas, chegadas descartadas, divergência entre pedidos disparados e
-recebidos, clientes não devolvidos/removidos e repetições incompletas. C ausente
-não é substituído por zero quando faltam os contadores.
-
-O coletor PostgreSQL mantém seu `statement_timeout` de 2s, exclusivo da sessão
-observadora. Se falhar antes do benchmark, o runner interrompe e nenhum C é
-calculado. Para falhas durante a carga, os resultados disponíveis são parciais e
-o status de falha do piloto é preservado. Esses relatórios requerem a imagem
-reconstruída com a nova instrumentação; logs antigos não têm contadores por coorte.
-
 ### Piloto com vários níveis
 
 Na raiz do checkout da VM, com Docker + Compose, k6, Python 3, curl e timeout
@@ -168,6 +121,22 @@ python3 -m venv .venv
 sudo RUN_ID=vm-pg-pilot-01 RATES=1,2,5,10,15,20,30,40 \
   DURATION=3m WARMUP_DURATION=1m bash run.sh
 ```
+
+Para o primeiro teste de funcionamento, um piloto curto com três taxas e uma
+repetição por taxa leva cerca de seis minutos, mais build, inicialização e
+drenagem. Ele usa o mesmo runner e gera os mesmos tipos de gráficos:
+
+```bash
+sudo RUN_ID="piloto-curto-$(date -u +%Y%m%dT%H%M%SZ)" \
+  RATES=1,10,40 REPETITIONS=1 DURATION=1m WARMUP_DURATION=30s \
+  K6_CSV_STORAGE=tmpfs bash run.sh
+```
+
+As taxas representam **disparos de requisições por segundo**. Uma repetição curta
+serve para validar a execução; a escolha de níveis e a avaliação de estabilidade
+devem usar o protocolo de medição com duração e repetições controladas. O modo
+`tmpfs` tem os requisitos descritos acima; `K6_CSV_STORAGE=disk` mantém a escrita
+de CSV em disco. Registre o modo escolhido e mantenha-o igual entre comparações.
 
 Se Docker funcionar sem sudo, retire `sudo`. As saídas são devolvidas ao usuário
 que invocou sudo, evitando arquivos ilegíveis. Use RUN_ID diferente a cada coleta;

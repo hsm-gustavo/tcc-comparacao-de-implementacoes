@@ -16,6 +16,8 @@ class RunnerTest(unittest.TestCase):
         scripts = self.root / 'scripts'
         (scripts / 'diagnostics').mkdir(parents=True)
         shutil.copyfile(Path(__file__).parents[1] / 'run-diagnostics.sh', scripts / 'run-diagnostics.sh')
+        shutil.copyfile(Path(__file__).with_name('dataset-permissions.sh'),
+                        scripts / 'diagnostics/dataset-permissions.sh')
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'],

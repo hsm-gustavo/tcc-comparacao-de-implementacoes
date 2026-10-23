@@ -99,7 +99,8 @@ done
 docker info >/dev/null
 "${COMPOSE[@]}" config --quiet
 umask 077
-mkdir -p "$(dirname "$OUT")"
+source "$ROOT_DIR/scripts/diagnostics/dataset-permissions.sh"
+dataset_prepare_parent "$ROOT_DIR" "$OUT"
 mkdir "$OUT" "$OUT/logs"
 children=()
 CSV_DIR="$OUT"
@@ -155,15 +156,13 @@ finish() {
       if (( $? == 0 )); then plots_status=generated; else plots_status=plots_pending; fi
     fi
   fi
+  : >"$OUT/status.json"
+  if ! dataset_return_ownership "$OUT" "$csv_staging"; then
+    echo "[pilot] Could not return dataset ownership to sudo's caller: $OUT" >&2
+    if (( status == 0 )); then status=1; phase=permissions; fi
+  fi
   printf '{"runId":"%s","exitCode":%d,"phase":"%s","plots":"%s","csvStorage":"%s","csvExport":"%s"}\n' \
     "$RUN_ID" "$status" "$phase" "$plots_status" "$K6_CSV_STORAGE" "$csv_export_status" >"$OUT/status.json"
-  if (( EUID == 0 )) && [[ "${SUDO_UID:-}" =~ ^[0-9]+$ && "${SUDO_GID:-}" =~ ^[0-9]+$ ]]; then
-    chown -- "$SUDO_UID:$SUDO_GID" "$(dirname "$OUT")"
-    chown -R -P --no-dereference -- "$SUDO_UID:$SUDO_GID" "$OUT"
-    if [[ -n "$csv_staging" && -d "$csv_staging" ]]; then
-      chown -R -P --no-dereference -- "$SUDO_UID:$SUDO_GID" "$csv_staging"
-    fi
-  fi
   echo "[pilot] Results: $OUT (exit=$status, phase=$phase, plots=$plots_status)"
   echo '[pilot] Containers and volumes preserved. HTTP success must be assessed in the results.'
   if (( status != 0 )) && [[ -f "$current_log" ]]; then tail -n 40 "$current_log" >&2; fi
@@ -216,7 +215,7 @@ data = {'architecture': 'distributed-baseline', 'database': 'postgres',
 (out/'metadata.json').write_text(json.dumps(data, indent=2)+'\n')
 files = [root/'run.sh', root/'experiments/k6/pilot.js', root/'experiments/analyze_pilot.py',
          root/'scripts/seed.sh', root/'scripts/diagnostics/collect-postgres.py',
-         root/'scripts/diagnostics/collect-host.py']
+         root/'scripts/diagnostics/collect-host.py', root/'scripts/diagnostics/dataset-permissions.sh']
 for service in ['order','warehouse','billing','shipping']:
     base = root/f'implementation/distributed-baseline/{service}-service'
     files += list((base/'src').rglob('*.ts'))

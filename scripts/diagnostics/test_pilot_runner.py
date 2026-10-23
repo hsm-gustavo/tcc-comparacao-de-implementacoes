@@ -20,12 +20,13 @@ class PilotRunnerTest(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         source = Path(__file__).resolve().parents[2]
-        for name in ('run.sh', 'experiments/k6/pilot.js', 'experiments/analyze_pilot.py', 'scripts/seed.sh'):
+        for name in ('run.sh', 'experiments/k6/pilot.js', 'experiments/analyze_pilot.py',
+                     'scripts/seed.sh', 'scripts/diagnostics/dataset-permissions.sh'):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source / name, path)
         scripts = self.root / 'scripts/diagnostics'
-        scripts.mkdir()
+        scripts.mkdir(exist_ok=True)
         (scripts / 'collect-postgres.py').write_text('''import pathlib, signal, sys
 out = pathlib.Path(sys.argv[sys.argv.index('--output-dir') + 1])
 (out/'postgres-activity.jsonl').write_text('{}\\n')
@@ -135,6 +136,34 @@ path.write_text(json.dumps({'phase':os.environ['PILOT_PHASE'], 'rate':int(os.env
         self.assertEqual(status['phase'], 'startup')
         self.assertEqual(status['exitCode'], 42)
         self.assertTrue((self.output / 'logs/startup.log').exists())
+
+    def test_sudo_permissions_repair_ancestors_and_partial_outputs_after_failure(self):
+        helper = self.root / 'scripts/diagnostics/dataset-permissions.sh'
+        with helper.open('a') as stream:
+            stream.write(f'\ndataset_sudo_owner() {{ printf "%s" "{os.getuid()}:{os.getgid()}"; }}\n')
+        self.output.parent.mkdir(parents=True, mode=0o700)
+        datasets = self.root / 'experiments/datasets'
+        datasets.chmod(0o000)
+        self.addCleanup(datasets.chmod, 0o700)
+        result = self.run_runner(FAKE_BUILD_EXIT='42')
+        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+        for directory in (datasets, self.output.parent, self.output, self.output / 'logs'):
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(json.loads((self.output / 'status.json').read_text())['phase'], 'startup')
+        self.assertEqual((self.output / 'logs/startup.log').stat().st_mode & 0o777, 0o600)
+
+    def test_permission_failure_is_reported_without_masking_previous_failure(self):
+        helper = self.root / 'scripts/diagnostics/dataset-permissions.sh'
+        with helper.open('a') as stream:
+            stream.write('\ndataset_return_ownership() { return 1; }\n')
+        for build_exit, expected_exit, phase in (('0', 1, 'permissions'), ('42', 42, 'startup')):
+            with self.subTest(build_exit=build_exit):
+                run_id = f'permissions-{build_exit}'
+                result = self.run_runner(RUN_ID=run_id, FAKE_BUILD_EXIT=build_exit)
+                self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
+                status = json.loads((self.output.parent / run_id / 'status.json').read_text())
+                self.assertEqual((status['exitCode'], status['phase']), (expected_exit, phase))
+                self.assertIn('Could not return dataset ownership', result.stderr)
 
     def test_repetitions_keep_order_and_separate_results_with_one_warmup_and_build(self):
         result = self.run_runner(REPETITIONS='3')

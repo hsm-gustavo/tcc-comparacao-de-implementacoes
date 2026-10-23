@@ -17,7 +17,6 @@ export BASE_URL="${BASE_URL:-http://127.0.0.1:8000}" WAREHOUSE_PREFIX=/warehouse
 export RUN_ID="${RUN_ID:-baseline-${RATE}rps-$(date -u +%Y%m%dT%H%M%SZ)}"
 export DB_DIAGNOSTICS="${DB_DIAGNOSTICS:-1}"
 OUT="$ROOT_DIR/experiments/datasets/diagnostics/$RUN_ID"
-DIAGNOSTICS_DIR="$(dirname "$OUT")"
 COMPOSE=(docker compose -f "$BASE" -f "$OVERLAY")
 [[ "$RUN_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || { echo 'Invalid RUN_ID' >&2; exit 1; }
 for command in docker python3 curl k6; do
@@ -26,7 +25,8 @@ done
 [[ ! -e "$OUT" ]] || { echo "Refusing to overwrite $OUT" >&2; exit 1; }
 docker info >/dev/null
 umask 077
-mkdir -p "$DIAGNOSTICS_DIR"
+source "$ROOT_DIR/scripts/diagnostics/dataset-permissions.sh"
+dataset_prepare_parent "$ROOT_DIR" "$OUT"
 mkdir "$OUT"
 children=()
 phase=initialization
@@ -52,12 +52,9 @@ cleanup() {
   fi
   : >"$OUT/status.json"
   # Keep private logs readable by the user who invoked sudo, including on failure.
-  if (( EUID == 0 )) && [[ "${SUDO_UID:-}" =~ ^[0-9]+$ && "${SUDO_GID:-}" =~ ^[0-9]+$ ]]; then
-    if ! chown -- "$SUDO_UID:$SUDO_GID" "$DIAGNOSTICS_DIR" || \
-       ! chown -R -P --no-dereference -- "$SUDO_UID:$SUDO_GID" "$OUT"; then
-      echo "[diagnostics] Could not return output ownership to uid=$SUDO_UID; inspect $OUT with sudo." >&2
-      (( status == 0 )) && status=1
-    fi
+  if ! dataset_return_ownership "$OUT"; then
+    echo "[diagnostics] Could not return dataset ownership to sudo's caller; inspect $OUT with sudo." >&2
+    (( status == 0 )) && status=1
   fi
   (( status == 0 )) && result=completed
   printf '{"runId":"%s","status":"%s","phase":"%s","exitCode":%d,"timestamp":"%s"}\n' \

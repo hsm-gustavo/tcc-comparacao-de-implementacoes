@@ -24,7 +24,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         entities: [Product],
         synchronize: true,
         extra: {
-          max: 20,
+          max: 80,
           connectionTimeoutMillis: 2000,
           idleTimeoutMillis: 30000,
         },

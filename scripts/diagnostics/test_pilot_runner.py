@@ -47,7 +47,8 @@ signal.pause()
                         AUTO_PLOT='0', COLLECT_HOST='0', DB_DIAGNOSTICS='1', SEED_DATA='auto',
                         PRE_ALLOCATED_VUS='2', MAX_VUS='2', REPETITIONS='1',
                         K6_CSV_STORAGE='disk', K6_CSV_TMPFS_ROOT='/dev/shm',
-                        FAKE_BUILD_EXIT='0', FAKE_K6_EXIT='0', FAKE_ROOT=str(self.root))
+                        FAKE_BUILD_EXIT='0', FAKE_K6_EXIT='0', FAKE_STOP_EXIT='0',
+                        FAKE_ROOT=str(self.root))
         self.output = self.root / 'experiments/datasets/pilot/pilot-test'
         self.tool('sleep', '#!/bin/sh\n/bin/sleep 0.02\n')
         self.tool('git', '#!/bin/sh\necho fixture-head\n')
@@ -60,6 +61,13 @@ if 'build' in sys.argv:
     print('fixture build')
     sys.exit(int(os.environ['FAKE_BUILD_EXIT']))
 if 'inspect' in sys.argv: print('healthy')
+if 'stop' in sys.argv:
+    out = pathlib.Path(os.environ['FAKE_ROOT'])/'experiments/datasets/pilot'/os.environ['RUN_ID']
+    (out/'shutdown-observation.json').write_text(json.dumps({
+        'csvs': sorted(p.name for p in out.glob('*.csv')),
+        'phases': [json.loads(line)['phase'] for line in (out/'phases.jsonl').read_text().splitlines()]}))
+    print('fixture container stop', flush=True)
+    sys.exit(int(os.environ['FAKE_STOP_EXIT']))
 if 'logs' in sys.argv and '--follow' in sys.argv:
     while True:
         print(json.dumps({'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -124,10 +132,18 @@ path.write_text(json.dumps({'phase':os.environ['PILOT_PHASE'], 'rate':int(os.env
         self.assertTrue((self.output / 'analysis/levels.csv').exists())
         status = json.loads((self.output / 'status.json').read_text())
         self.assertEqual((status['csvStorage'], status['csvExport']), ('disk', 'not_needed'))
+        self.assertEqual(status['containerStop'], 'stopped')
         for stage in ('warmup', 'rate1_run1', 'rate2_run1'):
             self.assertTrue((self.output / f'{stage}.csv').exists())
         calls = [json.loads(line) for line in (self.root / 'docker-calls.jsonl').read_text().splitlines()]
         self.assertFalse(any('down' in call or '--volumes' in call or 'rm' in call for call in calls))
+        stops = [call for call in calls if 'stop' in call]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0][-3:], ['stop', '--timeout', '60'])
+        observation = json.loads((self.output / 'shutdown-observation.json').read_text())
+        self.assertEqual(observation['phases'][-1], 'completed')
+        self.assertEqual(observation['csvs'], ['rate1_run1.csv', 'rate2_run1.csv', 'warmup.csv'])
+        self.assertIn('fixture container stop', (self.output / 'logs/shutdown.log').read_text())
 
     def test_build_failure_preserves_status_and_evidence(self):
         result = self.run_runner(FAKE_BUILD_EXIT='42')
@@ -135,7 +151,21 @@ path.write_text(json.dumps({'phase':os.environ['PILOT_PHASE'], 'rate':int(os.env
         status = json.loads((self.output / 'status.json').read_text())
         self.assertEqual(status['phase'], 'startup')
         self.assertEqual(status['exitCode'], 42)
+        self.assertEqual(status['containerStop'], 'stopped')
         self.assertTrue((self.output / 'logs/startup.log').exists())
+
+    def test_stop_failure_is_reported_without_masking_an_existing_load_failure(self):
+        for k6_exit, expected_exit, phase in (('0', 1, 'container_stop'), ('99', 99, 'rate1_run1')):
+            with self.subTest(k6_exit=k6_exit):
+                run_id = f'stop-failure-{k6_exit}'
+                result = self.run_runner(RUN_ID=run_id, FAKE_K6_EXIT=k6_exit, FAKE_STOP_EXIT='23')
+                self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
+                out = self.output.parent / run_id
+                status = json.loads((out / 'status.json').read_text())
+                self.assertEqual((status['exitCode'], status['phase'], status['containerStop']),
+                                 (expected_exit, phase, 'failed'))
+                self.assertIn('Could not stop experiment containers', result.stderr)
+                self.assertTrue((out / 'logs/shutdown.log').is_file())
 
     def test_sudo_permissions_repair_ancestors_and_partial_outputs_after_failure(self):
         helper = self.root / 'scripts/diagnostics/dataset-permissions.sh'
@@ -193,6 +223,7 @@ path.write_text(json.dumps({'phase':os.environ['PILOT_PHASE'], 'rate':int(os.env
         self.assertEqual(result.returncode, 99, result.stdout + result.stderr)
         self.assertEqual((self.output / 'rate1_run1.exit-code.txt').read_text().strip(), '99')
         self.assertFalse((self.output / 'rate2_run1.json').exists())
+        self.assertEqual(json.loads((self.output / 'status.json').read_text())['containerStop'], 'stopped')
 
     def test_existing_output_and_invalid_rates_are_rejected_before_docker(self):
         self.output.mkdir(parents=True)
@@ -238,6 +269,8 @@ assert {p.stem for p in out.glob('*.csv')} == expected
         status = json.loads((self.output / 'status.json').read_text())
         self.assertEqual((status['csvStorage'], status['csvExport'], status['plots']),
                          ('tmpfs', 'exported', 'generated'))
+        self.assertEqual(json.loads((self.output / 'shutdown-observation.json').read_text())['csvs'],
+                         ['rate1_run1.csv', 'rate1_run2.csv', 'rate2_run1.csv', 'rate2_run2.csv', 'warmup.csv'])
         self.assertTrue((self.output / 'analysis/plots-invoked.txt').exists())
         with (self.output / 'analysis/levels.csv').open() as stream:
             self.assertEqual(len(list(csv.DictReader(stream))), 5)
@@ -306,6 +339,7 @@ shutil.copyfile(source, destination)
             self.assertFalse((self.output / 'rate1_run1.json').exists())
             status = json.loads((self.output / 'status.json').read_text())
             self.assertEqual((status['exitCode'], status['csvExport']), (143, 'exported'))
+            self.assertEqual(status['containerStop'], 'stopped')
             self.assertEqual(list(memory_root.iterdir()), [])
             with self.assertRaises(ProcessLookupError):
                 os.kill(int(flag.read_text()), 0)

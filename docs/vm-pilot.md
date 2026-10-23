@@ -6,6 +6,17 @@ anterior `scripts/run.sh` e o piloto para múltiplas arquiteturas
 não troca configurações de banco/HTTP/NGINX e não modifica regras de negócio.
 A variante MySQL foi removida; resultados históricos não foram apagados.
 
+Ao encerrar, o `run.sh` para os containers deste Compose com `stop --timeout 60`,
+inclusive em falhas e interrupções tratadas. Os volumes, bancos e resultados são
+preservados. A parada acontece após encerrar a carga/coletores, exportar os CSVs e
+capturar evidências de falha, antes de gerar gráficos. A política existente
+`restart: unless-stopped` mantém os containers explicitamente parados também após
+reiniciar o computador; a próxima execução do runner volta a iniciá-los.
+`logs/shutdown.log` registra a parada e `status.json` informa
+`containerStop=stopped` ou `failed`. Se a parada falhar, o script avisa e termina
+com erro, preservando o código de uma falha anterior. Ações que não permitem
+executar o encerramento, como `SIGKILL` ou queda de energia, não fazem essa parada.
+
 Caso a stack MySQL experimental ainda esteja ligada na máquina local, encerre
 somente seus containers antes de voltar a executar PostgreSQL nessa máquina
 (não é necessário na VM que usou apenas PostgreSQL):
@@ -160,7 +171,8 @@ Depois executa:
 3. Entre patamares, 30 segundos de acomodação e verificação de amostra recente
    com `inUse=0` e `waiting=0` no pool do order-service. Espera adicional máxima
    de 60 segundos; se não recuperar, interrompe e preserva resultados parciais.
-4. Tabelas e gráficos após encerrar os coletores. Containers e volumes permanecem.
+4. Encerramento dos coletores, exportação dos CSVs e parada dos containers.
+   Depois são gerados tabelas e gráficos. Os volumes permanecem.
 
 O tempo padrão é aproximadamente **29 minutos, mais build, readiness e drenagem**.
 O cooldown não limpa caches nem reinicia serviços. A recuperação do pool do order

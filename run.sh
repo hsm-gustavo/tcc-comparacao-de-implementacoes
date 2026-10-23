@@ -23,6 +23,7 @@ K6_CSV_STORAGE=tmpfs stages ALL k6 CSVs in memory until load and recovery end,
 then copies them to the usual results directory before analysis/charts.
 K6_CSV_TMPFS_ROOT must be a writable tmpfs mount (findmnt is required).
 CSV files accumulate for the entire run: reserve enough free tmpfs/RAM space.
+Containers are stopped on exit, including failures and handled interruptions.
 Existing containers/volumes and previous results are never deleted.
 HELP
   exit 0
@@ -126,7 +127,7 @@ export_csv() {
   csv_export_status=exported
 }
 finish() {
-  local status=$? pid
+  local status=$? pid container_stop=stopped
   trap - EXIT INT TERM
   set +e
   for pid in "${children[@]}"; do kill -TERM "$pid" 2>/dev/null; done
@@ -140,6 +141,15 @@ finish() {
   if (( status != 0 )); then
     "${COMPOSE[@]}" ps --all >"$OUT/logs/final-containers.txt" 2>&1
     "${COMPOSE[@]}" logs --no-color --tail 100 >"$OUT/logs/failure.log" 2>&1
+  fi
+  # All measurements/collectors have ended. Explicit stop also keeps the
+  # existing unless-stopped restart policy from starting these on host reboot.
+  echo '[pilot] Stopping experiment containers (volumes preserved)...'
+  if ! "${COMPOSE[@]}" stop --timeout 60 >"$OUT/logs/shutdown.log" 2>&1; then
+    container_stop=failed
+    echo '[pilot] Could not stop experiment containers; see logs/shutdown.log' >&2
+    tail -n 20 "$OUT/logs/shutdown.log" >&2
+    if (( status == 0 )); then status=1; phase=container_stop; fi
   fi
   if [[ "$csv_export_status" != failed ]] && compgen -G "$OUT/rate*_run*.json" >/dev/null; then
     plots_status=summary_only
@@ -161,10 +171,10 @@ finish() {
     echo "[pilot] Could not return dataset ownership to sudo's caller: $OUT" >&2
     if (( status == 0 )); then status=1; phase=permissions; fi
   fi
-  printf '{"runId":"%s","exitCode":%d,"phase":"%s","plots":"%s","csvStorage":"%s","csvExport":"%s"}\n' \
-    "$RUN_ID" "$status" "$phase" "$plots_status" "$K6_CSV_STORAGE" "$csv_export_status" >"$OUT/status.json"
+  printf '{"runId":"%s","exitCode":%d,"phase":"%s","plots":"%s","csvStorage":"%s","csvExport":"%s","containerStop":"%s"}\n' \
+    "$RUN_ID" "$status" "$phase" "$plots_status" "$K6_CSV_STORAGE" "$csv_export_status" "$container_stop" >"$OUT/status.json"
   echo "[pilot] Results: $OUT (exit=$status, phase=$phase, plots=$plots_status)"
-  echo '[pilot] Containers and volumes preserved. HTTP success must be assessed in the results.'
+  echo "[pilot] Container stop: $container_stop; volumes preserved. HTTP success must be assessed in the results."
   if (( status != 0 )) && [[ -f "$current_log" ]]; then tail -n 40 "$current_log" >&2; fi
   if [[ "$plots_status" == plots_pending ]]; then
     echo "[pilot] Charts pending; see analysis.log or run: python3 experiments/analyze_pilot.py '$OUT'"

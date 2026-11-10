@@ -1,0 +1,14 @@
+**/node_modules
+**/dist
+**/coverage
+**/data
+**/__pycache__
+.git
+.venv
+experiments/datasets
+*.log
+**/*.log
+.env
+.env.docker
+**/.env
+**/.env.*

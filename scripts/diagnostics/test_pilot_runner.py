@@ -21,7 +21,11 @@ class PilotRunnerTest(unittest.TestCase):
         self.root = Path(self.directory.name)
         source = Path(__file__).resolve().parents[2]
         for name in ('run.sh', 'experiments/k6/pilot.js', 'experiments/analyze_pilot.py',
-                     'scripts/seed.sh', 'scripts/diagnostics/dataset-permissions.sh'):
+                     'scripts/seed.sh', 'scripts/diagnostics/dataset-permissions.sh',
+                     'scripts/pilot/compose.py', 'scripts/pilot/state.py', 'scripts/pilot/preload.py',
+                     'environment/nginx/distributed.conf', 'environment/pilot/Dockerfile',
+                     'environment/pilot/pnpm-workspace.yaml',
+                     'environment/pilot/register-diagnostics.cjs'):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source / name, path)
@@ -33,20 +37,22 @@ out = pathlib.Path(sys.argv[sys.argv.index('--output-dir') + 1])
 signal.pause()
 ''')
         (scripts / 'collect-host.py').write_text('')
-        for service in ('order', 'warehouse', 'billing', 'shipping'):
-            path = self.root / f'implementation/distributed-baseline/{service}-service'
-            path.mkdir(parents=True)
-            for name in ('package.json', 'pnpm-lock.yaml', 'Dockerfile'):
-                (path / name).write_text('test fixture')
-        (self.root / 'environment/compose').mkdir(parents=True)
+        for architecture in ('distributed-baseline', 'tcc', 'two-phase-commit', 'orchestrated-saga', 'choreographed-saga'):
+            for service in ('order', 'warehouse', 'billing', 'shipping'):
+                path = self.root / f'implementation/{architecture}/{service}-service'
+                path.mkdir(parents=True)
+                for name in ('package.json', 'pnpm-lock.yaml', 'Dockerfile'):
+                    (path / name).write_text('test fixture')
+        (self.root / 'environment/compose').mkdir()
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
                         RUN_ID='pilot-test', RATES='1,2', DURATION='1s', WARMUP_DURATION='1s',
                         SETTLING_SECONDS='0', COOLDOWN_SECONDS='0', RECOVERY_TIMEOUT_SECONDS='1',
                         AUTO_PLOT='0', COLLECT_HOST='0', DB_DIAGNOSTICS='1', SEED_DATA='auto',
+                        ARCHITECTURE='distributed-baseline', PILOT_ISOLATED='0', PILOT_SUITE_ID='',
                         PRE_ALLOCATED_VUS='2', MAX_VUS='2', REPETITIONS='1',
-                        K6_CSV_STORAGE='disk', K6_CSV_TMPFS_ROOT='/dev/shm',
+                        K6_CSV_STORAGE='disk', K6_CSV_TMPFS_ROOT='/dev/shm', PRELOAD_ORDERS='0',
                         FAKE_BUILD_EXIT='0', FAKE_K6_EXIT='0', FAKE_STOP_EXIT='0',
                         FAKE_ROOT=str(self.root))
         self.output = self.root / 'experiments/datasets/pilot/pilot-test'
@@ -61,8 +67,19 @@ if 'build' in sys.argv:
     print('fixture build')
     sys.exit(int(os.environ['FAKE_BUILD_EXIT']))
 if 'inspect' in sys.argv: print('healthy')
+if 'ps' in sys.argv and '--quiet' in sys.argv: print('fixture-db-id')
+if 'exec' in sys.argv and 'psql' in sys.argv:
+    if os.environ.get('FAKE_STATE_EXIT') == '3':
+        print('ERROR: canceling statement due to statement timeout', file=sys.stderr)
+        sys.exit(3)
+    print(json.dumps({'counts': {'pending': 1} if os.environ.get('FAKE_ASYNC_BACKLOG') else {'confirmed': 1}}))
+if 'exec' in sys.argv and 'rabbitmqctl' in sys.argv:
+    print('\\n'.join(f'{s}-saga-queue\\t0\\t0' for s in ['order','warehouse','billing','shipping']))
+    if os.environ.get('FAKE_ASYNC_BACKLOG'): print('order-saga-queue.errors\\t197\\t0')
 if 'stop' in sys.argv:
     out = pathlib.Path(os.environ['FAKE_ROOT'])/'experiments/datasets/pilot'/os.environ['RUN_ID']
+    if os.environ.get('PILOT_SUITE_ID'):
+        out = out.parent/os.environ['PILOT_SUITE_ID']/os.environ['ARCHITECTURE']
     (out/'shutdown-observation.json').write_text(json.dumps({
         'csvs': sorted(p.name for p in out.glob('*.csv')),
         'phases': [json.loads(line)['phase'] for line in (out/'phases.jsonl').read_text().splitlines()]}))
@@ -72,7 +89,8 @@ if 'logs' in sys.argv and '--follow' in sys.argv:
     while True:
         print(json.dumps({'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),
                           'type':'db_diagnostic_sample',
-                          'pool':{'total':1,'idle':1,'inUse':0,'waiting':0},
+                          'pool':{'total':1,'idle':0 if os.environ.get('FAKE_POOL_BUSY') else 1,
+                                  'inUse':1 if os.environ.get('FAKE_POOL_BUSY') else 0,'waiting':0},
                           'connectionAcquire':{'p95Ms':0},'connectionHold':{'p95Ms':0},
                           'queryDuration':{'p95Ms':0},'eventLoop':{'p99Ms':0}}), flush=True)
         time.sleep(.02)
@@ -361,6 +379,98 @@ shutil.copyfile(source, destination)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('K6_CSV_STORAGE must be disk or tmpfs', result.stderr)
         self.assertFalse((self.root / 'docker-calls.jsonl').exists())
+
+    def test_other_architectures_reuse_protocol_with_isolated_state_and_collection(self):
+        for architecture in ('tcc', 'two-phase-commit', 'orchestrated-saga', 'choreographed-saga'):
+            with self.subTest(architecture=architecture):
+                result = self.run_runner(ARCHITECTURE=architecture, PILOT_ISOLATED='1',
+                                         PILOT_SUITE_ID='suite-test', RUN_ID='suite-' + architecture)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                out = self.output.parent/'suite-test'/architecture
+                metadata = json.loads((out/'metadata.json').read_text())
+                self.assertEqual(metadata['architecture'], architecture)
+                self.assertEqual(metadata['environment']['REPETITIONS'], '1')
+                self.assertTrue((out/'postgres-activity.jsonl').exists())
+                self.assertTrue((out/'analysis/levels.csv').exists())
+                self.assertTrue((out/'business/rate2_run1.json').exists())
+                model = json.loads((out/'runtime/compose.json').read_text())
+                self.assertNotEqual(model['name'], 'distributed-lab-base')
+                self.assertNotIn('container_name', model['services']['order-db'])
+                self.assertEqual('rabbitmq' in model['services'], architecture == 'choreographed-saga')
+                self.assertEqual(json.loads((out/'status.json').read_text())['containerStop'], 'stopped')
+
+    def test_failed_diagnostic_snapshot_does_not_abort_synchronous_load_stages(self):
+        result = self.run_runner(ARCHITECTURE='orchestrated-saga', PILOT_ISOLATED='1',
+                                 FAKE_STATE_EXIT='3')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        status = json.loads((self.output/'status.json').read_text())
+        self.assertEqual(status['phase'], 'completed')
+        self.assertEqual(status['containerStop'], 'stopped')
+        self.assertIn('statement timeout', result.stderr)
+        for stage in ['warmup', 'rate1_run1', 'rate2_run1']:
+            record = json.loads((self.output/'business'/f'{stage}.json').read_text())
+            self.assertEqual(record['collectionStatus'], 'error')
+            self.assertIsNone(record['counts'])
+            self.assertTrue((self.output/f'{stage}.csv').exists())
+
+    def test_asynchronous_business_failure_continues_all_stages_and_preserves_errors(self):
+        result = self.run_runner(ARCHITECTURE='choreographed-saga', PILOT_ISOLATED='1',
+                                 FAKE_ASYNC_BACKLOG='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('WARNING: recovery incomplete', result.stdout)
+        self.assertEqual(json.loads((self.output/'status.json').read_text())['phase'], 'completed')
+        for index, stage in enumerate(['warmup', 'rate1_run1', 'rate2_run1']):
+            record = json.loads((self.output/'business'/f'{stage}.json').read_text())
+            self.assertEqual(record['counts']['pending'], 1)
+            self.assertFalse(record['settled'])
+            self.assertEqual(record['queueRecovery']['parkedMessages'], 197)
+            self.assertEqual(record['queueRecovery']['parkedNetChange'], 197 if index == 0 else 0)
+            self.assertTrue((self.output/f'{stage}.csv').exists())
+        analysis = json.loads((self.output/'analysis/summary.json').read_text())
+        self.assertTrue(any('business recovery incomplete' in w for w in analysis['warnings']))
+        self.assertTrue((self.output/'analysis/business.csv').exists())
+
+    def test_asynchronous_snapshot_failure_still_stops_load_and_stops_containers(self):
+        result = self.run_runner(ARCHITECTURE='choreographed-saga', PILOT_ISOLATED='1', FAKE_STATE_EXIT='3')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.output/'rate1_run1.csv').exists())
+        self.assertEqual(json.loads((self.output/'status.json').read_text())['containerStop'], 'stopped')
+
+    def test_pool_that_does_not_recover_still_stops_asynchronous_load(self):
+        result = self.run_runner(ARCHITECTURE='choreographed-saga', PILOT_ISOLATED='1', FAKE_POOL_BUSY='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Pool did not recover', result.stderr)
+        self.assertFalse((self.output/'rate1_run1.csv').exists())
+        self.assertEqual(json.loads((self.output/'status.json').read_text())['containerStop'], 'stopped')
+
+    def test_preload_requires_isolated_stack_before_startup(self):
+        result = self.run_runner(PRELOAD_ORDERS='10')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires PILOT_ISOLATED=1', result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_preload_precedes_collectors_and_only_one_warmup_without_resets(self):
+        script = self.root/'scripts/pilot/preload.py'
+        script.write_text("import pathlib,sys,json\n"
+                          "out=pathlib.Path(sys.argv[sys.argv.index('--output')+1]);out.mkdir()\n"
+                          "(out/'manifest.json').write_text(json.dumps({'status':'completed'}))\n")
+        result = self.run_runner(PRELOAD_ORDERS='10', PILOT_ISOLATED='1')
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        phases = [json.loads(line)['phase'] for line in (self.output/'phases.jsonl').read_text().splitlines()]
+        self.assertLess(phases.index('preload'), phases.index('collectors'))
+        self.assertLess(phases.index('collectors'), phases.index('warmup'))
+        self.assertEqual(phases.count('preload'), 1)
+        self.assertEqual(phases.count('warmup'), 1)
+        self.assertEqual(json.loads((self.output/'metadata.json').read_text())['environment']['PRELOAD_ORDERS'], '10')
+
+    def test_preload_failure_stops_before_any_load_and_preserves_evidence(self):
+        (self.root/'scripts/pilot/preload.py').write_text('raise SystemExit(43)\n')
+        result = self.run_runner(PRELOAD_ORDERS='10', PILOT_ISOLATED='1')
+        self.assertEqual(result.returncode, 43, result.stdout+result.stderr)
+        status = json.loads((self.output/'status.json').read_text())
+        self.assertEqual(status['phase'], 'preload')
+        self.assertEqual(status['containerStop'], 'stopped')
+        self.assertFalse((self.output/'warmup.json').exists())
 
 
 if __name__ == '__main__':

@@ -1,3 +1,4 @@
+import { MessageRecovery } from '../message-recovery';
 import { Module } from '@nestjs/common';
 import { BillingService } from './billing.service';
 import { BillingController } from './billing.controller';
@@ -7,7 +8,7 @@ import { Payment } from './entities/payment.entity';
 @Module({
   imports: [TypeOrmModule.forFeature([Payment])],
   controllers: [BillingController],
-  providers: [BillingService],
+  providers: [BillingService, MessageRecovery],
   exports: [BillingService],
 })
 export class BillingModule {}

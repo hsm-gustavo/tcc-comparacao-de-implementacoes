@@ -1,5 +1,8 @@
 # Piloto PostgreSQL na VM
 
+Para executar TCC, 2PC e as sagas em sequência, com o baseline opcional e
+comparativos entre gráficos, consulte [Comparação sequencial](sequential-pilots.md).
+
 O `run.sh` da **raiz** executa o distributed baseline com PostgreSQL. O runner
 anterior `scripts/run.sh` e o piloto para múltiplas arquiteturas
 `scripts/run-pilot.sh` continuam separados. Este novo piloto não apaga volumes,

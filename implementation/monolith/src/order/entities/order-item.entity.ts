@@ -1,8 +1,16 @@
 import { Product } from 'src/warehouse/entities/product.entity';
-import { Column, Entity, ManyToOne, PrimaryGeneratedColumn } from 'typeorm';
+import {
+  Column,
+  Entity,
+  Index,
+  ManyToOne,
+  PrimaryGeneratedColumn,
+} from 'typeorm';
 import { Order } from './order.entity';
 
 @Entity('order_items')
+@Index('IDX_order_items_order_id', ['order'])
+@Index('IDX_order_items_product_id', ['product'])
 export class OrderItem {
   @PrimaryGeneratedColumn('uuid')
   id: string;

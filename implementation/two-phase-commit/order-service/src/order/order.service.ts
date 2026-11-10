@@ -1,4 +1,8 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import {
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+} from '@nestjs/common';
 import { Repository } from 'typeorm';
 import { Order, OrderStatus } from './entities/order.entity';
 import { OrderItem } from './entities/order-item.entity';
@@ -9,9 +13,13 @@ import { firstValueFrom } from 'rxjs';
 
 @Injectable()
 export class OrderService {
-  private readonly WAREHOUSE_URL = 'http://localhost:3001/warehouse';
-  private readonly BILLING_URL = 'http://localhost:3002/billing';
-  private readonly SHIPPING_URL = 'http://localhost:3003/shipping';
+  private readonly logger = new Logger(OrderService.name);
+  private readonly WAREHOUSE_URL =
+    process.env.WAREHOUSE_URL ?? 'http://localhost:3001/warehouse';
+  private readonly BILLING_URL =
+    process.env.BILLING_URL ?? 'http://localhost:3002/billing';
+  private readonly SHIPPING_URL =
+    process.env.SHIPPING_URL ?? 'http://localhost:3003/shipping';
 
   constructor(
     @InjectRepository(Order) private orderRepo: Repository<Order>,
@@ -19,19 +27,26 @@ export class OrderService {
     private readonly httpService: HttpService,
   ) {}
   async createOrder(dto: CreateOrderDto) {
-    const order = this.orderRepo.create({
-      customerId: dto.customerId,
-      totalAmount: dto.amount,
-    });
-    const savedOrder = await this.orderRepo.save(order);
+    const savedOrder = await this.orderRepo.manager.transaction(
+      async (manager) => {
+        const order = manager.create(Order, {
+          customerId: dto.customerId,
+          totalAmount: dto.amount,
+        });
+        const saved = await manager.save(Order, order);
 
-    const item = this.orderItemRepo.create({
-      order: savedOrder,
-      productId: dto.productId,
-      quantity: dto.quantity,
-    });
-    await this.orderItemRepo.save(item);
+        const item = manager.create(OrderItem, {
+          order: saved,
+          productId: dto.productId,
+          quantity: dto.quantity,
+        });
+        await manager.save(OrderItem, item);
 
+        return saved;
+      },
+    );
+
+    let confirmationStarted = false;
     try {
       // 2. Phase 1: prepare all participants
       await firstValueFrom(
@@ -56,6 +71,7 @@ export class OrderService {
       );
 
       // 3. Phase 2: commit all participants
+      confirmationStarted = true;
       await firstValueFrom(
         this.httpService.patch(`${this.WAREHOUSE_URL}/commit-reserve`, {
           orderId: savedOrder.id,
@@ -77,7 +93,19 @@ export class OrderService {
       savedOrder.status = OrderStatus.CONFIRMED;
       return await this.orderRepo.save(savedOrder);
     } catch (err) {
-      await Promise.allSettled([
+      if (confirmationStarted) {
+        // An uncertain Confirm/Commit is not a new decision to Cancel/Rollback.
+        this.logger.error({
+          event: 'coordination.unresolved',
+          orderId: savedOrder.id,
+          phase: 'confirmation',
+          reason: String(err),
+        });
+        throw new InternalServerErrorException(
+          `Order confirmation outcome unknown: ${String(err)}`,
+        );
+      }
+      const cancellations = await Promise.allSettled([
         firstValueFrom(
           this.httpService.post(`${this.SHIPPING_URL}/rollback`, {
             orderId: savedOrder.id,
@@ -95,6 +123,17 @@ export class OrderService {
         ),
       ]);
 
+      if (cancellations.some((result) => result.status === 'rejected')) {
+        this.logger.error({
+          event: 'coordination.unresolved',
+          orderId: savedOrder.id,
+          phase: 'cancellation',
+          reason: String(err),
+        });
+        throw new InternalServerErrorException(
+          `Order cancellation outcome unknown: ${String(err)}`,
+        );
+      }
       savedOrder.status = OrderStatus.CANCELLED;
       await this.orderRepo.save(savedOrder);
 

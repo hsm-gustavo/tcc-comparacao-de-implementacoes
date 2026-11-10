@@ -7,10 +7,27 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from analyze_pilot import analyze_stage, enrich_http_metrics, measured_stages, percentile, plot, read_table, summarize_repetitions, write_csv
+from analyze_pilot import analyze_stage, business_outcomes, enrich_http_metrics, measured_stages, percentile, plot, read_table, summarize_repetitions, write_csv
 
 
 class AnalyzePilotTest(unittest.TestCase):
+    def test_business_counts_separate_http_acceptance_and_global_queue_net_change(self):
+        root = Path(self.directory.name)
+        (root/'business').mkdir()
+        rows = []
+        for index, parked in enumerate([197, 197, 210]):
+            stage = f'rate60_run{index + 1}'
+            rows.append(dict(stage=stage, rate=60, repetition=index + 1, phase='benchmark',
+                             start_epoch=index * 200, started=100, accepted=90))
+            (root/'business'/f'{stage}.json').write_text(json.dumps({
+                'counts': {'confirmed': 80, 'pending': 10}, 'settled': False,
+                'queues': [{'name': 'order-saga-queue.errors', 'ready': parked, 'unacknowledged': 0}]}))
+        results = business_outcomes(root, list(reversed(rows)))
+        self.assertEqual([r['parked_net_change'] for r in results], [197, 0, 13])
+        self.assertEqual(results[0]['http_accepted'], 90)
+        self.assertEqual(results[0]['confirmed'], 80)
+        self.assertEqual(results[0]['pending'], 10)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -133,17 +150,27 @@ class AnalyzePilotTest(unittest.TestCase):
         rows = enrich_http_metrics([row, high])
         root = self.path.parent
         (root / 'analysis').mkdir()
+        (root / 'metadata.json').write_text(json.dumps({'architecture': 'choreographed-saga'}))
+        (root / 'business').mkdir()
+        (root / 'business' / (row['stage'] + '.json')).write_text(json.dumps({
+            'counts': {'confirmed': 1, 'pending': 1}, 'settled': False,
+            'queues': [{'name': 'order-saga-queue.errors', 'ready': 1, 'unacknowledged': 0}]}))
         saved = {}
 
         def capture(figure, path, **kwargs):
             if path.name == 'throughput.png':
                 saved['limits'] = figure.axes[0].get_ylim()
+            if path.name == 'business.png':
+                saved['business_confirmed'] = list(figure.axes[0].lines[1].get_ydata())
+                saved['business_pending'] = list(figure.axes[1].lines[0].get_ydata())
 
         with patch.dict('os.environ', {'MPLCONFIGDIR': str(root / 'analysis/.matplotlib')}), \
                 patch('matplotlib.figure.Figure.savefig', capture):
             plot(root, rows, windows)
         self.assertEqual(saved['limits'][0], 0)
         self.assertGreater(saved['limits'][1], 40)
+        self.assertAlmostEqual(saved['business_confirmed'][0], 100 / 3)
+        self.assertEqual(saved['business_pending'], [1])
 
 
 if __name__ == '__main__':

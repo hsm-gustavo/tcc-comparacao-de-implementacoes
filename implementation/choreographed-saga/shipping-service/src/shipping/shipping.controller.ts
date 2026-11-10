@@ -1,3 +1,4 @@
+import { MessageRecovery } from '../message-recovery';
 import { Body, Controller, Get, Param, Post } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiTags } from '@nestjs/swagger';
 import { ShippingService } from './shipping.service';
@@ -7,7 +8,10 @@ import { Ctx, EventPattern, Payload, RmqContext } from '@nestjs/microservices';
 @ApiTags('shipping')
 @Controller('shipping')
 export class ShippingController {
-  constructor(private readonly shippingService: ShippingService) {}
+  constructor(
+    private readonly shippingService: ShippingService,
+    private readonly recovery: MessageRecovery,
+  ) {}
 
   @Post()
   @ApiOperation({ summary: 'Internal API: Create shipment' })
@@ -34,8 +38,7 @@ export class ShippingController {
       context.getChannelRef().ack(context.getMessage());
       return result;
     } catch (error) {
-      context.getChannelRef().nack(context.getMessage(), false, false);
-      throw error;
+      await this.recovery.handle(context, error, 'shipping-saga-queue');
     }
   }
 }

@@ -1,3 +1,4 @@
+import { MessageRecovery } from '../message-recovery';
 import { Module } from '@nestjs/common';
 import { OrderService } from './order.service';
 import { OrderController } from './order.controller';
@@ -15,6 +16,6 @@ import { HttpModule } from '@nestjs/axios';
     }),
   ],
   controllers: [OrderController],
-  providers: [OrderService],
+  providers: [OrderService, MessageRecovery],
 })
 export class OrderModule {}

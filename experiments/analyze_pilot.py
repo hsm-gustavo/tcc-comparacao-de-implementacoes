@@ -216,8 +216,46 @@ def read_pool(path):
     return samples
 
 
+def business_outcomes(root, rows):
+    """Keep cohort outcomes separate from HTTP acceptance and global queues."""
+    result = []
+    previous_parked = 0
+    for row in sorted(rows, key=lambda r: r['start_epoch']):
+        path = root / 'business' / (row['stage'] + '.json')
+        if not path.exists():
+            continue
+        record = json.loads(path.read_text())
+        counts = record.get('counts')
+        queue_rows = record.get('queues')
+        parked = active = None
+        if queue_rows is not None:
+            parked = sum(q['ready'] + q['unacknowledged'] for q in queue_rows if q['name'].endswith('.errors'))
+            active = sum(q['ready'] + q['unacknowledged'] for q in queue_rows if not q['name'].endswith('.errors'))
+        delta = record.get('queueRecovery', {}).get('parkedNetChange',
+                                                  None if parked is None else parked - previous_parked)
+        result.append({
+            'stage': row['stage'], 'rate': row['rate'], 'repetition': row['repetition'],
+            'phase': row['phase'], 'start_epoch': row['start_epoch'],
+            'started': row['started'], 'http_accepted': row['accepted'],
+            'confirmed': None if counts is None else counts.get('confirmed', 0),
+            'cancelled': None if counts is None else counts.get('cancelled', 0),
+            'pending': None if counts is None else counts.get('pending', 0),
+            'active_messages': active, 'parked_messages': parked, 'parked_net_change': delta,
+            'settled': record.get('settled'),
+            'recovery_status': record.get('recoveryStatus',
+                                          'unknown' if record.get('settled') is None else
+                                          'settled' if record['settled'] else 'incomplete'),
+        })
+        if parked is not None:
+            previous_parked = parked
+    return result
+
+
 def plot(root, rows, windows):
     output = root / 'analysis'
+    metadata = json.loads((root / 'metadata.json').read_text()) if (root / 'metadata.json').exists() else {}
+    asynchronous = metadata.get('architecture') == 'choreographed-saga'
+    run_label = root.name + (' | HTTP = aceitação; conclusão assíncrona em business/' if asynchronous else '')
     os.environ.setdefault('MPLCONFIGDIR', str(output / '.matplotlib'))
     try:
         import matplotlib
@@ -238,6 +276,26 @@ def plot(root, rows, windows):
         path.parent.mkdir(exist_ok=True)
         fig.savefig(path, dpi=160)
         plt.close(fig)
+
+    outcomes = [r for r in business_outcomes(root, rows) if r['phase'] == 'benchmark']
+    if asynchronous and outcomes:
+        origin = outcomes[0]['start_epoch']
+        x = [(r['start_epoch'] - origin) / 60 for r in outcomes]
+        fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True, constrained_layout=True)
+        for key, label in [('http_accepted', 'Aceitação HTTP 201'), ('confirmed', 'Pedidos confirmados após recuperação')]:
+            axes[0].plot(x, [None if r[key] is None or not r['started'] else 100 * r[key] / r['started'] for r in outcomes], '.-', label=label)
+        axes[0].set_ylabel('% dos disparos da repetição')
+        axes[1].plot(x, [r['pending'] for r in outcomes], '.-', label='Pendentes da repetição após recuperação')
+        axes[1].set_ylabel('Pedidos')
+        for key, label in [('parked_messages', '.errors acumulado'), ('parked_net_change', 'Variação líquida de .errors'), ('active_messages', 'Mensagens em filas ativas/retry')]:
+            axes[2].plot(x, [r[key] for r in outcomes], '.-', label=label)
+        axes[2].set_ylabel('Mensagens globais')
+        axes[2].set_xlabel('Minutos desde o início da primeira repetição')
+        for axis in axes:
+            axis.legend(fontsize=9)
+            axis.grid(alpha=.2)
+        fig.suptitle('Conclusão de negócio — ' + root.name + '\nSnapshots após recuperação; filas globais, sem reprocessar mensagens estacionadas.')
+        save(fig, output / 'business.png')
 
     def distribution(axis, metric, label, color, scale=1, linestyle='-'):
         medians, lower, upper = [], [], []
@@ -266,7 +324,7 @@ def plot(root, rows, windows):
     distribution(axes[1, 1], 'successful_p50_ms', 'p50 dos HTTP 201', blue, .001)
     distribution(axes[1, 1], 'successful_p99_ms', 'p99 dos HTTP 201', orange, .001, '--')
     for axis, title, unit in zip(axes.flat,
-                               ['Carga entregue e vazão útil', 'Latência: sucessos e todas as respostas',
+                               ['Carga entregue e aceitação HTTP' if asynchronous else 'Carga entregue e vazão útil', 'Latência: sucessos e todas as respostas',
                                 'Falhas e descartes', 'Mediana e cauda dos sucessos'],
                                ['requisições/s', 'segundos', '%', 'segundos']):
         axis.set(title=title, xlabel='Nível solicitado (requisições/s)', ylabel=unit)
@@ -274,7 +332,7 @@ def plot(root, rows, windows):
         axis.set_ylim(bottom=0)
         axis.grid(axis='y', alpha=.2)
         axis.legend(fontsize=9)
-    fig.suptitle(root.name + ' | ' + repetitions_note + '\nLinha = mediana entre repetições; faixa = P25–P75; pontos = repetições individuais\n'
+    fig.suptitle(run_label + ' | ' + repetitions_note + '\nLinha = mediana entre repetições; faixa = P25–P75; pontos = repetições individuais\n'
                  'Percentis resumidos são de cada repetição, não de todas as requisições agrupadas.', fontsize=12)
     save(fig, output / 'capacity.png')
 
@@ -283,7 +341,7 @@ def plot(root, rows, windows):
         axis.set(title=title, xlabel='Nível solicitado (requisições/s)', ylabel=unit)
         axis.set_xticks(range(len(rates)), [str(r) for r in rates])
         axis.grid(axis='y', alpha=.2)
-        fig.suptitle(root.name + ' | ' + repetitions_note + '\n'
+        fig.suptitle(run_label + ' | ' + repetitions_note + '\n'
                      'Linha = mediana entre repetições; faixa = P25–P75; pontos = repetições individuais', fontsize=11)
         return fig, axis
 
@@ -318,7 +376,7 @@ def plot(root, rows, windows):
         axis.legend(loc='upper left', fontsize=9)
     axes[-1].set_xticks(range(len(rates)), [str(r) for r in rates])
     axes[-1].set_xlabel('Nível solicitado (requisições/s)')
-    fig.suptitle(root.name + ' | Latência HTTP | ' + repetitions_note + '\n'
+    fig.suptitle(run_label + ' | Latência HTTP | ' + repetitions_note + '\n'
                  'Linha = mediana das métricas por repetição; faixa = P25–P75\n'
                  'p95/p99 não são percentis globais; a curva Média resume médias individuais.', fontsize=11)
     save(fig, output / 'latency.png')
@@ -354,7 +412,7 @@ def plot(root, rows, windows):
                             text = f'{number:.2f}' if title.endswith('(s)') and number < 1 else f'{number:.1f}'
                         color = 'white' if image.norm(number) > .65 else '#202020'
                         axis.text(x, y, text, ha='center', va='center', fontsize=7, color=color)
-        fig.suptitle(root.name + '\nCada célula representa uma repetição; cinza = dado ausente ou percentil indefinido.', fontsize=12)
+        fig.suptitle(run_label + '\nCada célula representa uma repetição; cinza = dado ausente ou percentil indefinido.', fontsize=12)
         save(fig, output / 'repetitions.png')
 
     by_stage = {}
@@ -506,9 +564,16 @@ def main():
     grouped = summarize_repetitions(rows)
     if grouped:
         write_csv(output / 'by_rate.csv', grouped)
-    report = {'run': root.name, 'stages': len(rows), 'warnings': warnings,
+    outcomes = business_outcomes(root, rows)
+    if outcomes:
+        write_csv(output / 'business.csv', outcomes)
+        warnings.extend(f"{r['stage']}: business recovery {r['recovery_status']}; pending={r['pending']}, parked={r['parked_messages']}, parked net change={r['parked_net_change']}"
+                        for r in outcomes if r['recovery_status'] in ('incomplete', 'unknown'))
+    report = {'run': root.name, 'architecture': metadata.get('architecture'),
+              'responseSemantics': metadata.get('responseSemantics'), 'stages': len(rows), 'warnings': warnings,
               'semantics': {
                   'accepted': 'HTTP 201 only; verify business state separately',
+                  'business': 'Cohort state at its post-load snapshot, not a final audit or end-to-end latency. Queue counts are global; parked net change is not unique orders or exact new arrivals. Consult metadata.businessRecoveryPolicy for continuation policy; older runs may have stopped on backlog.',
                   'accepted_rps': 'successful responses / observation including drain, excluding setup',
                   'availability_pct': 'HTTP 201 / observed HTTP requests * 100; includes client timeouts in denominator, excludes dropped iterations; not uptime',
                   'response_rps': 'all observed HTTP responses, including failures, / observation including drain, excluding setup',
@@ -522,7 +587,7 @@ def main():
         print('WARNING: ' + warning)
     if not args.no_plots:
         plot(root, rows, windows)
-        print('Charts: availability.png, throughput.png, latency.png, capacity.png, repetitions.png, timeline.png and timeline_by_rate/; pool.png and pool_by_rate/ when diagnostics exist')
+        print('Charts: availability.png, throughput.png, latency.png, capacity.png, repetitions.png, timeline.png and timeline_by_rate/; pool.png and pool_by_rate/ when diagnostics exist; business.png for asynchronous outcomes')
 
 
 if __name__ == '__main__':

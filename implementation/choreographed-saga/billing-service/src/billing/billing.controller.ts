@@ -1,3 +1,4 @@
+import { MessageRecovery } from '../message-recovery';
 import { Body, Controller, Get, Param, Post } from '@nestjs/common';
 import { ApiBody, ApiOperation, ApiParam, ApiTags } from '@nestjs/swagger';
 import { BillingService } from './billing.service';
@@ -8,7 +9,10 @@ import { Ctx, EventPattern, Payload, RmqContext } from '@nestjs/microservices';
 @ApiTags('billing')
 @Controller('billing')
 export class BillingController {
-  constructor(private readonly billingService: BillingService) {}
+  constructor(
+    private readonly billingService: BillingService,
+    private readonly recovery: MessageRecovery,
+  ) {}
 
   @Post('process')
   @ApiOperation({ summary: 'Internal API: Process payment' })
@@ -40,8 +44,7 @@ export class BillingController {
       context.getChannelRef().ack(context.getMessage());
       return result;
     } catch (error) {
-      context.getChannelRef().nack(context.getMessage(), false, false);
-      throw error;
+      await this.recovery.handle(context, error, 'billing-saga-queue');
     }
   }
 
@@ -55,8 +58,7 @@ export class BillingController {
       context.getChannelRef().ack(context.getMessage());
       return result;
     } catch (error) {
-      context.getChannelRef().nack(context.getMessage(), false, false);
-      throw error;
+      await this.recovery.handle(context, error, 'billing-saga-queue');
     }
   }
 }

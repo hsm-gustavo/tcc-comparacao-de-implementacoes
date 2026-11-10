@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Exploratory PostgreSQL capacity pilot for the distributed baseline.
+# Exploratory PostgreSQL capacity pilot; baseline remains the default.
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${1:-}" == --help ]]; then
   cat <<'HELP'
 Usage: [RUN_ID=vm-pilot-01] [RATES=1,2,5,10,15,20,30,40] bash run.sh
+       ARCHITECTURE=tcc RUN_ID=tcc-01 bash run.sh
 Example: RUN_ID=vm-pilot-5reps REPETITIONS=5 bash run.sh
 Starts the PostgreSQL distributed baseline, seeds an empty catalog, warms up,
 and measures ascending constant-arrival-rate plateaus without resetting volumes.
@@ -15,6 +16,8 @@ Defaults: DURATION=3m WARMUP_DURATION=1m WARMUP_RATE=1 REPETITIONS=1
 REPETITIONS repeats each rate before advancing, e.g. rate1_run1, rate1_run2,
 then rate2_run1, rate2_run2. DURATION applies to each repetition; warmup runs once.
 Cooldown and pool recovery run between repetitions. Each has its own CSV/JSON.
+Incomplete choreography business recovery is recorded as a warning and does not
+abort subsequent repetitions. Messages and pending orders remain preserved.
 PRE_ALLOCATED_VUS defaults to 25 * highest RATE (20 s HTTP timeout + headroom).
 MAX_VUS defaults to PRE_ALLOCATED_VUS, avoiding runtime VU allocation by default.
 PLOT_PYTHON can select a Python environment with matplotlib. Otherwise summaries
@@ -23,13 +26,24 @@ K6_CSV_STORAGE=tmpfs stages ALL k6 CSVs in memory until load and recovery end,
 then copies them to the usual results directory before analysis/charts.
 K6_CSV_TMPFS_ROOT must be a writable tmpfs mount (findmnt is required).
 CSV files accumulate for the entire run: reserve enough free tmpfs/RAM space.
+PRELOAD_ORDERS=249120 optionally creates coherent successful historical orders before warmup.
+Requires an isolated stack and empty order/payment/shipment/reservation tables. Default=0.
+History is setup only; warmup and all measured repetitions continue accumulating data.
 Containers are stopped on exit, including failures and handled interruptions.
+Isolated stacks also remove containers/networks on exit; named volumes remain preserved.
 Existing containers/volumes and previous results are never deleted.
+ARCHITECTURE: distributed-baseline (default), tcc, two-phase-commit,
+              orchestrated-saga, choreographed-saga.
+Other architectures use isolated stacks/volumes and the same collectors/charts.
+DB_POOL_MAX optionally overrides pool max; omitted preserves each implementation.
+run-suite.sh runs architectures sequentially, with separate result directories.
 HELP
   exit 0
 fi
 (( $# == 0 )) || { echo 'Use bash run.sh --help' >&2; exit 1; }
-export RUN_ID="${RUN_ID:-vm-pg-pilot-$(date -u +%Y%m%dT%H%M%SZ)}"
+export ARCHITECTURE="${ARCHITECTURE:-distributed-baseline}"
+export PILOT_ISOLATED="${PILOT_ISOLATED:-$([[ "$ARCHITECTURE" == distributed-baseline ]] && echo 0 || echo 1)}"
+export RUN_ID="${RUN_ID:-${ARCHITECTURE}-pilot-$(date -u +%Y%m%dT%H%M%SZ)}"
 export RATES="${RATES:-1,2,5,10,15,20,30,40}"
 export DURATION="${DURATION:-3m}" WARMUP_DURATION="${WARMUP_DURATION:-1m}"
 export WARMUP_RATE="${WARMUP_RATE:-1}" REPETITIONS="${REPETITIONS:-1}"
@@ -40,15 +54,33 @@ export DB_DIAGNOSTICS="${DB_DIAGNOSTICS:-1}" COLLECT_HOST="${COLLECT_HOST:-1}"
 export K6_CSV_STORAGE="${K6_CSV_STORAGE:-disk}"
 export K6_CSV_TMPFS_ROOT="${K6_CSV_TMPFS_ROOT:-/dev/shm}"
 export SEED_DATA="${SEED_DATA:-auto}" BASE_URL=http://127.0.0.1:8000 WAREHOUSE_PREFIX=/warehouse
+export PRELOAD_ORDERS="${PRELOAD_ORDERS:-0}"
 export TZ=UTC
 export STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 AUTO_PLOT="${AUTO_PLOT:-1}"
 PLOT_PYTHON="${PLOT_PYTHON:-$ROOT_DIR/.venv/bin/python}"
 [[ -x "$PLOT_PYTHON" ]] || PLOT_PYTHON=python3
 OUT="$ROOT_DIR/experiments/datasets/pilot/$RUN_ID"
+if [[ -n "${PILOT_SUITE_ID:-}" ]]; then
+  [[ "$PILOT_SUITE_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,59}$ ]] || { echo 'Invalid PILOT_SUITE_ID' >&2; exit 1; }
+  OUT="$ROOT_DIR/experiments/datasets/pilot/$PILOT_SUITE_ID/$ARCHITECTURE"
+fi
 BASE="$ROOT_DIR/environment/compose/compose.base.yaml"
 COMPOSE=(docker compose -f "$BASE" -f "$ROOT_DIR/environment/compose/compose.diagnostics.yaml")
 fail() { echo "[pilot] $*" >&2; exit 1; }
+[[ "$ARCHITECTURE" =~ ^(distributed-baseline|tcc|two-phase-commit|orchestrated-saga|choreographed-saga)$ ]] || fail 'Unsupported ARCHITECTURE'
+[[ "$PILOT_ISOLATED" =~ ^[01]$ ]] || fail 'PILOT_ISOLATED must be 0 or 1'
+[[ "$ARCHITECTURE" == distributed-baseline || "$PILOT_ISOLATED" == 1 ]] || fail 'Other architectures require isolated stacks'
+[[ -z "${DB_POOL_MAX:-}" || "$DB_POOL_MAX" =~ ^[1-9][0-9]{0,5}$ ]] || fail 'DB_POOL_MAX must be a positive integer'
+if [[ "$PILOT_ISOLATED" == 1 ]]; then
+  BASE="$OUT/runtime/compose.json"
+  COMPOSE=(docker compose -f "$BASE")
+fi
+[[ "$PRELOAD_ORDERS" =~ ^(0|[1-9][0-9]{0,7})$ ]] || fail 'PRELOAD_ORDERS must be a nonnegative integer'
+(( PRELOAD_ORDERS <= 10000000 )) || fail 'PRELOAD_ORDERS maximum is 10000000'
+if (( PRELOAD_ORDERS > 0 )); then
+  [[ "$PILOT_ISOLATED" == 1 ]] || fail 'PRELOAD_ORDERS requires PILOT_ISOLATED=1 (use run-suite.sh)'
+fi
 [[ "$RUN_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$ ]] || fail 'Invalid RUN_ID'
 [[ ! -e "$OUT" ]] || fail "Refusing to overwrite $OUT"
 [[ "$RATES" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || fail 'RATES must be ascending comma-separated positive integers'
@@ -98,7 +130,7 @@ for tool in docker k6 curl python3 tail timeout; do
   command -v "$tool" >/dev/null || fail "Missing dependency: $tool"
 done
 docker info >/dev/null
-"${COMPOSE[@]}" config --quiet
+if [[ "$PILOT_ISOLATED" == 0 ]]; then "${COMPOSE[@]}" config --quiet; fi
 umask 077
 source "$ROOT_DIR/scripts/diagnostics/dataset-permissions.sh"
 dataset_prepare_parent "$ROOT_DIR" "$OUT"
@@ -142,10 +174,17 @@ finish() {
     "${COMPOSE[@]}" ps --all >"$OUT/logs/final-containers.txt" 2>&1
     "${COMPOSE[@]}" logs --no-color --tail 100 >"$OUT/logs/failure.log" 2>&1
   fi
-  # All measurements/collectors have ended. Explicit stop also keeps the
-  # existing unless-stopped restart policy from starting these on host reboot.
+  # All measurements/collectors have ended. Isolated runs have unique networks:
+  # remove those stacks without -v so subnet allocations do not accumulate.
+  # Keep the shared baseline's existing stop-only behavior.
+  local shutdown=(stop --timeout 60)
+  if [[ "$PILOT_ISOLATED" == 1 && -f "$OUT/runtime/compose.json" ]]; then
+    "${COMPOSE[@]}" ps --all >"$OUT/logs/final-containers.txt" 2>&1
+    "${COMPOSE[@]}" logs --no-color --tail 100 >"$OUT/logs/final-container-logs.txt" 2>&1
+    shutdown=(down --timeout 60)
+  fi
   echo '[pilot] Stopping experiment containers (volumes preserved)...'
-  if ! "${COMPOSE[@]}" stop --timeout 60 >"$OUT/logs/shutdown.log" 2>&1; then
+  if ! "${COMPOSE[@]}" "${shutdown[@]}" >"$OUT/logs/shutdown.log" 2>&1; then
     container_stop=failed
     echo '[pilot] Could not stop experiment containers; see logs/shutdown.log' >&2
     tail -n 20 "$OUT/logs/shutdown.log" >&2
@@ -184,6 +223,13 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [[ "$PILOT_ISOLATED" == 1 ]]; then
+  mkdir "$OUT/runtime" "$OUT/business"
+  export COMPOSE_PROJECT_NAME
+  COMPOSE_PROJECT_NAME="$(python3 "$ROOT_DIR/scripts/pilot/compose.py" \
+    --architecture "$ARCHITECTURE" --run-id "$RUN_ID" --output "$OUT/runtime")"
+  "${COMPOSE[@]}" config --quiet
+fi
 if [[ "$K6_CSV_STORAGE" == tmpfs ]]; then
   csv_staging="$(mktemp -d "$K6_CSV_TMPFS_ROOT/k6-pilot.$RUN_ID.XXXXXX")"
   CSV_DIR="$csv_staging"
@@ -202,7 +248,7 @@ mark() {
   printf '{"phase":"%s","timestamp":"%s"}\n' "$phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$OUT/phases.jsonl"
   echo "[pilot] $phase"
 }
-echo "[pilot] Output: $OUT; rates=$RATES; repetitions=$REPETITIONS per rate; duration=$DURATION per repetition; VUs=$PRE_ALLOCATED_VUS/$MAX_VUS"
+echo "[pilot] Architecture: $ARCHITECTURE; output: $OUT; rates=$RATES; repetitions=$REPETITIONS per rate; duration=$DURATION per repetition; VUs=$PRE_ALLOCATED_VUS/$MAX_VUS"
 echo "[pilot] CSV storage during load: $K6_CSV_STORAGE ($CSV_DIR)"
 mark metadata
 git -C "$ROOT_DIR" rev-parse HEAD >"$OUT/git-head.txt" 2>/dev/null || true
@@ -215,21 +261,27 @@ root, out, csv_dir = map(pathlib.Path, sys.argv[1:])
 keys = ['RUN_ID','STARTED_AT','RATES','DURATION','WARMUP_DURATION','WARMUP_RATE','REPETITIONS',
         'SETTLING_SECONDS','COOLDOWN_SECONDS','RECOVERY_TIMEOUT_SECONDS',
         'PRE_ALLOCATED_VUS','MAX_VUS','DB_DIAGNOSTICS','COLLECT_HOST','SEED_DATA',
-        'K6_CSV_STORAGE','K6_CSV_TMPFS_ROOT']
-data = {'architecture': 'distributed-baseline', 'database': 'postgres',
-        'environment': {k: os.environ[k] for k in keys},
+        'K6_CSV_STORAGE','K6_CSV_TMPFS_ROOT','ARCHITECTURE','PILOT_ISOLATED','DB_POOL_MAX','COMPOSE_PROJECT_NAME','PRELOAD_ORDERS']
+data = {'architecture': os.environ['ARCHITECTURE'], 'database': 'postgres',
+        'businessRecoveryPolicy': 'Record incomplete business recovery and continue cumulatively; pool recovery and asynchronous observation failures remain fatal.',
+        'responseSemantics': 'HTTP acceptance; completion is asynchronous' if os.environ['ARCHITECTURE'] == 'choreographed-saga' else 'HTTP response after synchronous coordination',
+        'environment': {k: os.environ.get(k) for k in keys},
         'csvOutput': {'storage': os.environ['K6_CSV_STORAGE'], 'pathDuringLoad': str(csv_dir),
                       'availableBytesBeforeRun': os.statvfs(csv_dir).f_bavail * os.statvfs(csv_dir).f_frsize,
                       'exportPolicy': 'Copy tmpfs CSVs only after all load/recovery and child shutdown, before analysis.'},
-        'datasetPolicy': 'Reuse volumes; seed only an empty catalog; ascending exploratory sweep without resets.'}
+        'datasetPolicy': 'Optional synthetic history, then cumulative warmup/benchmarks without resets' if int(os.environ['PRELOAD_ORDERS']) else 'Reuse volumes; seed only an empty catalog; ascending exploratory sweep without resets.'}
 (out/'metadata.json').write_text(json.dumps(data, indent=2)+'\n')
 files = [root/'run.sh', root/'experiments/k6/pilot.js', root/'experiments/analyze_pilot.py',
          root/'scripts/seed.sh', root/'scripts/diagnostics/collect-postgres.py',
          root/'scripts/diagnostics/collect-host.py', root/'scripts/diagnostics/dataset-permissions.sh']
 for service in ['order','warehouse','billing','shipping']:
-    base = root/f'implementation/distributed-baseline/{service}-service'
+    base = root/f'implementation/{os.environ["ARCHITECTURE"]}/{service}-service'
     files += list((base/'src').rglob('*.ts'))
-    files += [base/'package.json', base/'pnpm-lock.yaml', base/'Dockerfile']
+    files += [p for p in [base/'package.json', base/'pnpm-lock.yaml', base/'Dockerfile'] if p.exists()]
+if os.environ['PILOT_ISOLATED'] == '1':
+    files += list((root/'implementation/distributed-baseline/order-service/src/diagnostics').glob('*.ts'))
+    files += list((root/'environment/pilot').glob('*')) + list((root/'scripts/pilot').glob('*.py'))
+    if (root/'.dockerignore').exists(): files.append(root/'.dockerignore')
 files += list((root/'environment/compose').glob('*.yaml'))
 (out/'source-sha256.json').write_text(json.dumps({str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                                               for p in files}, indent=2)+'\n')
@@ -240,7 +292,9 @@ current_log="$OUT/logs/startup.log"
 "${COMPOSE[@]}" up --detach order-db warehouse-db billing-db shipping-db >>"$current_log" 2>&1
 deadline=$((SECONDS + 600))
 for service in order warehouse billing shipping; do
-  until [[ "$(docker inspect --format '{{.State.Health.Status}}' "$service-db")" == healthy ]]; do
+  container="$service-db"
+  if [[ "$PILOT_ISOLATED" == 1 ]]; then container="$("${COMPOSE[@]}" ps --all --quiet "$service-db")"; fi
+  until [[ "$(docker inspect --format '{{.State.Health.Status}}' "$container")" == healthy ]]; do
     (( SECONDS < deadline )) || fail "Database initialization timeout: $service-db"
     sleep 2
   done
@@ -268,6 +322,16 @@ elif [[ "$catalog_size" != 0 && "$SEED_DATA" == 1 ]]; then
 elif [[ "$catalog_size" == 0 ]]; then
   fail 'Catalog is empty and SEED_DATA=0'
 fi
+if [[ "$PILOT_ISOLATED" == 1 ]]; then
+  curl -fsS --max-time 10 "$BASE_URL/warehouse/products" >"$OUT/catalog-used.json"
+fi
+if (( PRELOAD_ORDERS > 0 )); then
+  mark preload
+  current_log="$OUT/logs/preload.log"
+  python3 "$ROOT_DIR/scripts/pilot/preload.py" --compose "$BASE" \
+    --architecture "$ARCHITECTURE" --orders "$PRELOAD_ORDERS" \
+    --catalog "$OUT/catalog-used.json" --output "$OUT/preload" >"$current_log" 2>&1
+fi
 mark collectors
 current_log="$OUT/postgres-collector.log"
 python3 "$ROOT_DIR/scripts/diagnostics/collect-postgres.py" --output-dir "$OUT" \
@@ -292,7 +356,7 @@ run_stage() {
   local prefix="$1" rate="$2" duration="$3" repetition="$4" kind="$5" code=0 began=$SECONDS child
   mark "$prefix"
   current_log="$OUT/logs/${prefix}_k6.log"
-  ARCHITECTURE=distributed-baseline RATE="$rate" DURATION="$duration" REPETITION="$repetition" \
+  ARCHITECTURE="$ARCHITECTURE" RATE="$rate" DURATION="$duration" REPETITION="$repetition" \
   RUN_ID="$RUN_ID-$prefix" PILOT_PHASE="$kind" LOG_ERRORS=false SUMMARY_JSON="$OUT/$prefix.json" \
     k6 run --out "csv=$CSV_DIR/$prefix.csv" "$ROOT_DIR/experiments/k6/pilot.js" >"$current_log" 2>&1 &
   local load_pid=$!; children+=("$load_pid")
@@ -314,10 +378,12 @@ run_stage() {
   [[ -s "$OUT/$prefix.json" ]] || fail "Missing k6 summary: $prefix"
   kill -0 "$postgres_pid" 2>/dev/null || fail 'PostgreSQL collector stopped during stage'
 }
+previous_business_snapshot=""
 recover() {
+  local stage="$1"
   mark recovery
   sleep "$COOLDOWN_SECONDS"
-  [[ "$DB_DIAGNOSTICS" == 1 ]] || return 0
+  if [[ "$DB_DIAGNOSTICS" == 1 ]]; then
   local deadline=$((SECONDS + RECOVERY_TIMEOUT_SECONDS))
   while ! tail -n 200 "$OUT/application.log" | python3 -c '
 import datetime, json, sys
@@ -335,14 +401,26 @@ sys.exit(0 if age < 5 and last["pool"]["inUse"] == 0 and last["pool"]["waiting"]
     (( SECONDS < deadline )) || fail 'Pool did not recover; stopping to avoid mixing plateaus. Inspect application.log.'
     sleep 2
   done
+  fi
+  if [[ "$PILOT_ISOLATED" == 1 ]]; then
+    local -a extra=()
+    if [[ "$ARCHITECTURE" == choreographed-saga ]]; then
+      extra=(--wait-seconds "$RECOVERY_TIMEOUT_SECONDS" --broker)
+      if [[ -n "$previous_business_snapshot" ]]; then extra+=(--previous "$previous_business_snapshot"); fi
+    fi
+    python3 "$ROOT_DIR/scripts/pilot/state.py" --compose "$BASE" \
+      --customer-prefix "customer-k6-$ARCHITECTURE-$RUN_ID-$stage-" \
+      --output "$OUT/business/$stage.json" "${extra[@]}"
+    previous_business_snapshot="$OUT/business/$stage.json"
+  fi
 }
 run_stage warmup "$WARMUP_RATE" "$WARMUP_DURATION" 0 warmup
-recover
+recover warmup
 for rate in "${rates[@]}"; do
   for ((repetition=1; repetition<=REPETITIONS; repetition++)); do
     echo "[pilot] Rate=$rate requests/s; repetition=$repetition/$REPETITIONS"
     run_stage "rate${rate}_run${repetition}" "$rate" "$DURATION" "$repetition" benchmark
-    recover
+    recover "rate${rate}_run${repetition}"
   done
 done
 mark completed

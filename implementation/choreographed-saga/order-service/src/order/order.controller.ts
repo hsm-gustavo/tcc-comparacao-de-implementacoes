@@ -1,3 +1,4 @@
+import { MessageRecovery } from '../message-recovery';
 import { Controller, Post, Body } from '@nestjs/common';
 import { ApiBody, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { OrderService } from './order.service';
@@ -7,7 +8,10 @@ import { Ctx, EventPattern, Payload, RmqContext } from '@nestjs/microservices';
 @ApiTags('orders')
 @Controller('orders')
 export class OrderController {
-  constructor(private readonly orderService: OrderService) {}
+  constructor(
+    private readonly orderService: OrderService,
+    private readonly recovery: MessageRecovery,
+  ) {}
 
   @Post()
   @ApiOperation({ summary: 'Cria um pedido' })
@@ -26,8 +30,7 @@ export class OrderController {
       context.getChannelRef().ack(context.getMessage());
       return result;
     } catch (error) {
-      context.getChannelRef().nack(context.getMessage(), false, false);
-      throw error;
+      await this.recovery.handle(context, error, 'order-saga-queue');
     }
   }
 
@@ -41,8 +44,7 @@ export class OrderController {
       context.getChannelRef().ack(context.getMessage());
       return result;
     } catch (error) {
-      context.getChannelRef().nack(context.getMessage(), false, false);
-      throw error;
+      await this.recovery.handle(context, error, 'order-saga-queue');
     }
   }
 
@@ -56,8 +58,7 @@ export class OrderController {
       context.getChannelRef().ack(context.getMessage());
       return result;
     } catch (error) {
-      context.getChannelRef().nack(context.getMessage(), false, false);
-      throw error;
+      await this.recovery.handle(context, error, 'order-saga-queue');
     }
   }
 
@@ -71,8 +72,7 @@ export class OrderController {
       context.getChannelRef().ack(context.getMessage());
       return result;
     } catch (error) {
-      context.getChannelRef().nack(context.getMessage(), false, false);
-      throw error;
+      await this.recovery.handle(context, error, 'order-saga-queue');
     }
   }
 }

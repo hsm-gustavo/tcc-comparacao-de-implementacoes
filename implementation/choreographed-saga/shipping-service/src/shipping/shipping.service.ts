@@ -3,11 +3,7 @@ import { Shipment, ShippingStatus } from './entities/shipment.entity';
 import { Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
-import {
-  ClientProxy,
-  ClientProxyFactory,
-  Transport,
-} from '@nestjs/microservices';
+import { SagaPublisher } from '../saga-publisher';
 
 type ShippingSagaPayload = {
   orderId: string;
@@ -20,48 +16,14 @@ type ShippingSagaPayload = {
 };
 
 @Injectable()
-export class ShippingService {
-  private readonly rabbitUrl =
-    process.env.RABBITMQ_URL ?? 'amqp://guest:guest@localhost:5672';
+export class ShippingService extends SagaPublisher {
   private readonly orderQueue = 'order-saga-queue';
-  private readonly billingQueue = 'billing-saga-queue';
-  private readonly warehouseQueue = 'warehouse-saga-queue';
 
   constructor(
     @InjectRepository(Shipment)
     private shipmentRepository: Repository<Shipment>,
-  ) {}
-
-  private createClient(queue: string): ClientProxy {
-    return ClientProxyFactory.create({
-      transport: Transport.RMQ,
-      options: {
-        urls: [this.rabbitUrl],
-        queue,
-        queueOptions: {
-          durable: true,
-        },
-      },
-    });
-  }
-
-  private async emit(
-    queue: string,
-    pattern: string,
-    payload: ShippingSagaPayload,
   ) {
-    const client = this.createClient(queue);
-
-    try {
-      await new Promise<void>((resolve, reject) => {
-        client.emit(pattern, payload).subscribe({
-          complete: resolve,
-          error: reject,
-        });
-      });
-    } finally {
-      await client.close();
-    }
+    super();
   }
 
   async createShipment(dto: CreateShipmentDto) {
@@ -77,13 +39,22 @@ export class ShippingService {
   }
 
   async createSagaShipment(payload: ShippingSagaPayload) {
-    const existingShipment = await this.getShipmentByOrderId(payload.orderId);
-
-    if (existingShipment) {
-      return existingShipment;
-    }
-
-    return this.createShipment({ orderId: payload.orderId });
+    return this.shipmentRepository.manager.transaction(async (manager) => {
+      await manager.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [payload.orderId],
+      );
+      const existing = await manager.findOneBy(Shipment, {
+        orderId: payload.orderId,
+      });
+      if (existing) return existing;
+      const shipment = manager.create(Shipment, {
+        orderId: payload.orderId,
+        status: ShippingStatus.SHIPPED,
+        trackingCode: `BR-${Math.random().toString(36).toUpperCase().substring(2, 9)}`,
+      });
+      return manager.save(Shipment, shipment);
+    });
   }
 
   async getShipmentByOrderId(orderId: string) {
@@ -101,48 +72,13 @@ export class ShippingService {
   }
 
   async onPaymentConfirmed(payload: ShippingSagaPayload) {
-    try {
-      const shipment = await this.createSagaShipment(payload);
-
+    const shipment = await this.createSagaShipment(payload);
+    if (shipment.status === ShippingStatus.SHIPPED) {
       await this.emit(this.orderQueue, 'shipping.shipment_created', {
-        orderId: payload.orderId,
-        customerId: payload.customerId,
-        productId: payload.productId,
-        quantity: payload.quantity,
-        amount: payload.amount,
+        ...payload,
         trackingCode: shipment.trackingCode,
       });
-
-      return shipment;
-    } catch (error) {
-      await Promise.all([
-        this.emit(this.orderQueue, 'shipping.shipment_failed', {
-          orderId: payload.orderId,
-          customerId: payload.customerId,
-          productId: payload.productId,
-          quantity: payload.quantity,
-          amount: payload.amount,
-          reason: String(error),
-        }),
-        this.emit(this.billingQueue, 'shipping.shipment_failed', {
-          orderId: payload.orderId,
-          customerId: payload.customerId,
-          productId: payload.productId,
-          quantity: payload.quantity,
-          amount: payload.amount,
-          reason: String(error),
-        }),
-        this.emit(this.warehouseQueue, 'shipping.shipment_failed', {
-          orderId: payload.orderId,
-          customerId: payload.customerId,
-          productId: payload.productId,
-          quantity: payload.quantity,
-          amount: payload.amount,
-          reason: String(error),
-        }),
-      ]);
-
-      throw error;
     }
+    return shipment;
   }
 }

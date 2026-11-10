@@ -38,6 +38,8 @@ export class WarehouseService {
   }
 
   async reserveStock(dto: ReserveStockDto) {
+    if (!Number.isInteger(dto.quantity) || dto.quantity <= 0)
+      throw new BadRequestException('Quantity must be a positive integer');
     const result = await this.productsRepository
       .createQueryBuilder()
       .update()
@@ -75,13 +77,15 @@ export class WarehouseService {
   }
 
   async releaseStock(dto: ReleaseStockDto) {
-    const product = await this.productsRepository.findOneBy({
-      id: dto.productId,
-    });
-    if (product) {
-      product.stockQuantity += dto.quantity;
-      await this.productsRepository.save(product);
-    }
+    if (!Number.isInteger(dto.quantity) || dto.quantity <= 0)
+      throw new BadRequestException('Quantity must be a positive integer');
+    await this.productsRepository
+      .createQueryBuilder()
+      .update()
+      .set({ stockQuantity: () => '"stockQuantity" + :quantity' })
+      .where('id = :productId', { productId: dto.productId })
+      .setParameters({ quantity: dto.quantity })
+      .execute();
   }
 
   async remove(id: string) {

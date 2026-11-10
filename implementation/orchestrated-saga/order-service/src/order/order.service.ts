@@ -35,36 +35,44 @@ export class OrderService {
     let stockReserved = false;
     let paymentProcessed = false;
     let shipmentCreated = false;
+    let remoteInFlight = false;
 
-    const order = this.orderRepo.create({
-      customerId: dto.customerId,
-      totalAmount: dto.amount,
-    });
-    const savedOrder = await this.measure(
-      'database.order.save',
-      () => this.orderRepo.save(order),
-      {
-        productId: dto.productId,
-        customerId: dto.customerId,
-      },
-    );
+    const savedOrder = await this.orderRepo.manager.transaction(
+      async (manager) => {
+        const order = manager.create(Order, {
+          customerId: dto.customerId,
+          totalAmount: dto.amount,
+        });
+        const saved = await this.measure(
+          'database.order.save',
+          () => manager.save(Order, order),
+          {
+            productId: dto.productId,
+            customerId: dto.customerId,
+          },
+        );
 
-    const item = this.orderItemRepo.create({
-      order: savedOrder,
-      productId: dto.productId,
-      quantity: dto.quantity,
-    });
-    await this.measure(
-      'database.order-item.save',
-      () => this.orderItemRepo.save(item),
-      {
-        orderId: savedOrder.id,
-        productId: dto.productId,
+        const item = manager.create(OrderItem, {
+          order: saved,
+          productId: dto.productId,
+          quantity: dto.quantity,
+        });
+        await this.measure(
+          'database.order-item.save',
+          () => manager.save(OrderItem, item),
+          {
+            orderId: saved.id,
+            productId: dto.productId,
+          },
+        );
+
+        return saved;
       },
     );
 
     try {
       // Step 1: reserve stock.
+      remoteInFlight = true;
       await this.callService(
         'warehouse.reserve',
         this.httpService.patch(`${this.WAREHOUSE_URL}/reserve`, {
@@ -76,9 +84,11 @@ export class OrderService {
           productId: dto.productId,
         },
       );
+      remoteInFlight = false;
       stockReserved = true;
 
       // Step 2: process payment.
+      remoteInFlight = true;
       await this.callService(
         'billing.process',
         this.httpService.post(`${this.BILLING_URL}/process`, {
@@ -90,9 +100,11 @@ export class OrderService {
           productId: dto.productId,
         },
       );
+      remoteInFlight = false;
       paymentProcessed = true;
 
       // Step 3: create shipment.
+      remoteInFlight = true;
       await this.callService(
         'shipping.create',
         this.httpService.post(this.SHIPPING_URL, {
@@ -103,6 +115,7 @@ export class OrderService {
           productId: dto.productId,
         },
       );
+      remoteInFlight = false;
       shipmentCreated = true;
 
       savedOrder.status = OrderStatus.CONFIRMED;
@@ -126,7 +139,7 @@ export class OrderService {
 
       return confirmedOrder;
     } catch (error: unknown) {
-      await this.compensate(
+      const compensated = await this.compensate(
         dto,
         savedOrder.id,
         shipmentCreated,
@@ -134,14 +147,29 @@ export class OrderService {
         stockReserved,
       );
 
-      savedOrder.status = OrderStatus.CANCELLED;
-      await this.measure(
-        'database.order.cancel',
-        () => this.orderRepo.save(savedOrder),
-        {
+      const outcomeUnknown =
+        remoteInFlight &&
+        (!isAxiosError(error) ||
+          !error.response ||
+          error.response.status >= 500 ||
+          [408, 429].includes(error.response.status));
+      if (compensated && !outcomeUnknown) {
+        savedOrder.status = OrderStatus.CANCELLED;
+        await this.measure(
+          'database.order.cancel',
+          () => this.orderRepo.save(savedOrder),
+          {
+            orderId: savedOrder.id,
+          },
+        );
+      } else {
+        this.logger.error({
+          event: 'orchestrated-saga.unresolved',
           orderId: savedOrder.id,
-        },
-      );
+          outcomeUnknown,
+          compensationComplete: compensated,
+        });
+      }
 
       const details = this.extractErrorDetails(error);
 
@@ -226,6 +254,7 @@ export class OrderService {
         failedCompensations,
       });
     }
+    return failedCompensations === 0;
   }
 
   private async callService<T>(
@@ -254,10 +283,10 @@ export class OrderService {
 
       this.logger.error({
         event: 'internal-http.failed',
-        operation,
         durationMs: this.elapsed(startedAt),
         ...context,
         ...details,
+        operation,
       });
 
       if (isAxiosError(err)) {

@@ -1,14 +1,14 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import {
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+} from '@nestjs/common';
 import { Repository } from 'typeorm';
 import { Order, OrderStatus } from './entities/order.entity';
 import { OrderItem } from './entities/order-item.entity';
 import { InjectRepository } from '@nestjs/typeorm';
 import { CreateOrderDto } from './dto/create-order.dto';
-import {
-  ClientProxy,
-  ClientProxyFactory,
-  Transport,
-} from '@nestjs/microservices';
+import { SagaPublisher } from '../saga-publisher';
 
 type OrderSagaPayload = {
   orderId: string;
@@ -21,61 +21,31 @@ type OrderSagaPayload = {
 };
 
 @Injectable()
-export class OrderService {
-  private readonly rabbitUrl =
-    process.env.RABBITMQ_URL ?? 'amqp://guest:guest@localhost:5672';
+export class OrderService extends SagaPublisher {
+  private readonly logger = new Logger(OrderService.name);
   private readonly warehouseQueue = 'warehouse-saga-queue';
 
-  constructor(
-    @InjectRepository(Order) private orderRepo: Repository<Order>,
-    @InjectRepository(OrderItem) private orderItemRepo: Repository<OrderItem>,
-  ) {}
-
-  private createClient(queue: string): ClientProxy {
-    return ClientProxyFactory.create({
-      transport: Transport.RMQ,
-      options: {
-        urls: [this.rabbitUrl],
-        queue,
-        queueOptions: {
-          durable: true,
-        },
-      },
-    });
-  }
-
-  private async emit(
-    queue: string,
-    pattern: string,
-    payload: OrderSagaPayload,
-  ) {
-    const client = this.createClient(queue);
-
-    try {
-      await new Promise<void>((resolve, reject) => {
-        client.emit(pattern, payload).subscribe({
-          complete: resolve,
-          error: reject,
-        });
-      });
-    } finally {
-      await client.close();
-    }
+  constructor(@InjectRepository(Order) private orderRepo: Repository<Order>) {
+    super();
   }
 
   async createOrder(dto: CreateOrderDto) {
-    const order = this.orderRepo.create({
-      customerId: dto.customerId,
-      totalAmount: dto.amount,
-    });
-    const savedOrder = await this.orderRepo.save(order);
-
-    const item = this.orderItemRepo.create({
-      order: savedOrder,
-      productId: dto.productId,
-      quantity: dto.quantity,
-    });
-    await this.orderItemRepo.save(item);
+    const savedOrder = await this.orderRepo.manager.transaction(
+      async (manager) => {
+        const order = manager.create(Order, {
+          customerId: dto.customerId,
+          totalAmount: dto.amount,
+        });
+        const saved = await manager.save(Order, order);
+        const item = manager.create(OrderItem, {
+          order: saved,
+          productId: dto.productId,
+          quantity: dto.quantity,
+        });
+        await manager.save(OrderItem, item);
+        return saved;
+      },
+    );
 
     try {
       await this.emit(this.warehouseQueue, 'order.created', {
@@ -88,8 +58,13 @@ export class OrderService {
 
       return savedOrder;
     } catch (err) {
-      savedOrder.status = OrderStatus.CANCELLED;
-      await this.orderRepo.save(savedOrder);
+      // A failed publisher confirmation does not prove that the broker received nothing.
+      // Keep the durable pending state; a late success event may still confirm it.
+      this.logger.error({
+        event: 'publication.outcome-unknown',
+        orderId: savedOrder.id,
+        reason: String(err),
+      });
 
       throw new InternalServerErrorException(
         `Distributed Order failed: ${String(err)}`,
@@ -98,24 +73,18 @@ export class OrderService {
   }
 
   async markConfirmed(payload: OrderSagaPayload) {
-    const order = await this.orderRepo.findOneBy({ id: payload.orderId });
-
-    if (!order || order.status === OrderStatus.CANCELLED) {
-      return order;
-    }
-
-    order.status = OrderStatus.CONFIRMED;
-    return this.orderRepo.save(order);
+    await this.orderRepo.update(
+      { id: payload.orderId, status: OrderStatus.PENDING },
+      { status: OrderStatus.CONFIRMED },
+    );
+    return this.orderRepo.findOneBy({ id: payload.orderId });
   }
 
   async markCancelled(payload: OrderSagaPayload) {
-    const order = await this.orderRepo.findOneBy({ id: payload.orderId });
-
-    if (!order || order.status === OrderStatus.CONFIRMED) {
-      return order;
-    }
-
-    order.status = OrderStatus.CANCELLED;
-    return this.orderRepo.save(order);
+    await this.orderRepo.update(
+      { id: payload.orderId, status: OrderStatus.PENDING },
+      { status: OrderStatus.CANCELLED },
+    );
+    return this.orderRepo.findOneBy({ id: payload.orderId });
   }
 }

@@ -24,8 +24,8 @@ import { OrderItem } from './order/entities/order-item.entity';
       entities: [Payment, Shipment, Product, Order, OrderItem],
       synchronize: true,
       extra: {
-        max: 20,
-        connectionTimeoutMillis: 15000,
+        max: Number(process.env.DB_POOL_MAX ?? 80),
+        connectionTimeoutMillis: 2000,
         idleTimeoutMillis: 30000,
       },
     }),

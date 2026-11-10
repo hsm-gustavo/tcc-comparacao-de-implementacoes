@@ -9,4 +9,7 @@ __pycache__
 test_clearml.py
 experiments/datasets/diagnostics/
 experiments/datasets/pilot/
+experiments/datasets/faults
 scripts/diagnostics/*.md
+docs/
+artifacts/

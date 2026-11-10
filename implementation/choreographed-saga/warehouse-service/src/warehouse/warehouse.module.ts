@@ -1,3 +1,4 @@
+import { MessageRecovery } from '../message-recovery';
 import { Module } from '@nestjs/common';
 import { WarehouseService } from './warehouse.service';
 import { WarehouseController } from './warehouse.controller';
@@ -8,7 +9,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 @Module({
   imports: [TypeOrmModule.forFeature([Product, StockReservation])],
   controllers: [WarehouseController],
-  providers: [WarehouseService],
+  providers: [WarehouseService, MessageRecovery],
   exports: [WarehouseService],
 })
 export class WarehouseModule {}

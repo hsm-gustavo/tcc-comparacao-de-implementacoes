@@ -26,7 +26,7 @@ import { DiagnosticsModule } from './diagnostics/diagnostics.module';
         entities: [Order, OrderItem],
         synchronize: true,
         extra: {
-          max: 80,
+          max: Number(process.env.DB_POOL_MAX ?? 80),
           connectionTimeoutMillis: 2000,
           idleTimeoutMillis: 30000,
         },

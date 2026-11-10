@@ -37,30 +37,36 @@ export class OrderService {
   async createOrder(dto: CreateOrderDto) {
     const startedAt = performance.now();
 
-    const order = this.orderRepo.create({
-      customerId: dto.customerId,
-      totalAmount: dto.amount,
-    });
-    const savedOrder = await this.measure(
-      'database.order.save',
-      () => this.orderRepo.save(order),
-      {
-        productId: dto.productId,
-        customerId: dto.customerId,
-      },
-    );
+    const savedOrder = await this.orderRepo.manager.transaction(
+      async (manager) => {
+        const order = manager.create(Order, {
+          customerId: dto.customerId,
+          totalAmount: dto.amount,
+        });
+        const saved = await this.measure(
+          'database.order.save',
+          () => manager.save(Order, order),
+          {
+            productId: dto.productId,
+            customerId: dto.customerId,
+          },
+        );
 
-    const item = this.orderItemRepo.create({
-      order: savedOrder,
-      productId: dto.productId,
-      quantity: dto.quantity,
-    });
-    await this.measure(
-      'database.order-item.save',
-      () => this.orderItemRepo.save(item),
-      {
-        orderId: savedOrder.id,
-        productId: dto.productId,
+        const item = manager.create(OrderItem, {
+          order: saved,
+          productId: dto.productId,
+          quantity: dto.quantity,
+        });
+        await this.measure(
+          'database.order-item.save',
+          () => manager.save(OrderItem, item),
+          {
+            orderId: saved.id,
+            productId: dto.productId,
+          },
+        );
+
+        return saved;
       },
     );
 
@@ -199,10 +205,10 @@ export class OrderService {
 
       this.logger.error({
         event: 'internal-http.failed',
-        operation,
         durationMs: this.elapsed(startedAt),
         ...context,
         ...details,
+        operation,
       });
 
       if (isAxiosError(err)) {

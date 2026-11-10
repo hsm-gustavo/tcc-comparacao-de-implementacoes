@@ -1,3 +1,4 @@
+import { MessageRecovery } from '../message-recovery';
 import {
   Controller,
   Post,
@@ -16,7 +17,10 @@ import { Ctx, EventPattern, Payload, RmqContext } from '@nestjs/microservices';
 @ApiTags('warehouse')
 @Controller('warehouse')
 export class WarehouseController {
-  constructor(private readonly warehouseService: WarehouseService) {}
+  constructor(
+    private readonly warehouseService: WarehouseService,
+    private readonly recovery: MessageRecovery,
+  ) {}
 
   @Post('products')
   @ApiOperation({ summary: 'Cria produto no estoque' })
@@ -62,8 +66,7 @@ export class WarehouseController {
       context.getChannelRef().ack(context.getMessage());
       return result;
     } catch (error) {
-      context.getChannelRef().nack(context.getMessage(), false, false);
-      throw error;
+      await this.recovery.handle(context, error, 'warehouse-saga-queue');
     }
   }
 
@@ -78,8 +81,7 @@ export class WarehouseController {
       context.getChannelRef().ack(context.getMessage());
       return result;
     } catch (error) {
-      context.getChannelRef().nack(context.getMessage(), false, false);
-      throw error;
+      await this.recovery.handle(context, error, 'warehouse-saga-queue');
     }
   }
 }

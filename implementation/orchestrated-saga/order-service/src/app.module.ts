@@ -25,7 +25,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         entities: [Order, OrderItem],
         synchronize: true,
         extra: {
-          max: 20,
+          max: Number(process.env.DB_POOL_MAX ?? 80),
           connectionTimeoutMillis: 2000,
           idleTimeoutMillis: 30000,
         },

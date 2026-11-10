@@ -100,6 +100,17 @@ dataset_return_ownership "$2"
         self.assertEqual(self.out.stat().st_mode & 0o777, 0o700)
         self.assertEqual((self.out / 'application.log').stat().st_mode & 0o777, 0o600)
 
+    def test_repairs_every_parent_of_a_nested_suite(self):
+        self.out = self.root / 'experiments/datasets/pilot/suite/tcc'
+        self.out.parent.mkdir(parents=True)
+        pilot = self.root / 'experiments/datasets/pilot'
+        pilot.chmod(0o000)
+        self.addCleanup(pilot.chmod, 0o700)
+        result = self.run_helper('dataset_prepare_parent "$1" "$2"\nmkdir "$2"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(pilot.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.out.parent.stat().st_uid, os.getuid())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -13,11 +13,7 @@ import {
   StockReservation,
   StockReservationStatus,
 } from './entities/stock-reservation.entity';
-import {
-  ClientProxy,
-  ClientProxyFactory,
-  Transport,
-} from '@nestjs/microservices';
+import { SagaPublisher } from '../saga-publisher';
 
 type WarehouseSagaPayload = {
   orderId: string;
@@ -29,9 +25,7 @@ type WarehouseSagaPayload = {
 };
 
 @Injectable()
-export class WarehouseService {
-  private readonly rabbitUrl =
-    process.env.RABBITMQ_URL ?? 'amqp://guest:guest@localhost:5672';
+export class WarehouseService extends SagaPublisher {
   private readonly billingQueue = 'billing-saga-queue';
   private readonly orderQueue = 'order-saga-queue';
 
@@ -39,38 +33,8 @@ export class WarehouseService {
     @InjectRepository(Product) private productsRepository: Repository<Product>,
     @InjectRepository(StockReservation)
     private stockReservationRepository: Repository<StockReservation>,
-  ) {}
-
-  private createClient(queue: string): ClientProxy {
-    return ClientProxyFactory.create({
-      transport: Transport.RMQ,
-      options: {
-        urls: [this.rabbitUrl],
-        queue,
-        queueOptions: {
-          durable: true,
-        },
-      },
-    });
-  }
-
-  private async emit(
-    queue: string,
-    pattern: string,
-    payload: WarehouseSagaPayload,
   ) {
-    const client = this.createClient(queue);
-
-    try {
-      await new Promise<void>((resolve, reject) => {
-        client.emit(pattern, payload).subscribe({
-          complete: resolve,
-          error: reject,
-        });
-      });
-    } finally {
-      await client.close();
-    }
+    super();
   }
 
   async create(createProductDto: CreateProductDto) {
@@ -116,95 +80,89 @@ export class WarehouseService {
   }
 
   async reserveForSaga(payload: WarehouseSagaPayload) {
-    const existingReservation = await this.stockReservationRepository.findOneBy(
-      {
+    return this.productsRepository.manager.transaction(async (manager) => {
+      // Serializes duplicate deliveries, including when no reservation exists yet.
+      await manager.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [payload.orderId],
+      );
+      const existing = await manager.findOneBy(StockReservation, {
         orderId: payload.orderId,
-      },
-    );
-
-    if (existingReservation) {
-      return { reservation: existingReservation, created: false };
-    }
-
-    const product = await this.productsRepository.findOneBy({
-      id: payload.productId,
+      });
+      if (existing) return { reservation: existing, created: false };
+      if (!Number.isInteger(payload.quantity) || payload.quantity <= 0) {
+        throw new BadRequestException('Quantity must be a positive integer');
+      }
+      const product = await manager.findOne(Product, {
+        where: { id: payload.productId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!product) throw new NotFoundException('Product not found');
+      if (product.stockQuantity < payload.quantity)
+        throw new BadRequestException('Insufficient stock');
+      product.stockQuantity -= payload.quantity;
+      const reservation = manager.create(StockReservation, {
+        orderId: payload.orderId,
+        productId: payload.productId,
+        quantity: payload.quantity,
+        status: StockReservationStatus.RESERVED,
+      });
+      await manager.save(Product, product);
+      await manager.save(StockReservation, reservation);
+      return { reservation, created: true };
     });
-
-    if (!product) {
-      throw new NotFoundException('Product not found');
-    }
-
-    if (product.stockQuantity < payload.quantity) {
-      throw new BadRequestException('Insufficient stock');
-    }
-
-    product.stockQuantity -= payload.quantity;
-
-    const reservation = this.stockReservationRepository.create({
-      orderId: payload.orderId,
-      productId: payload.productId,
-      quantity: payload.quantity,
-      status: StockReservationStatus.RESERVED,
-    });
-
-    await this.productsRepository.save(product);
-    await this.stockReservationRepository.save(reservation);
-
-    return { reservation, created: true };
   }
 
   async releaseReservation(orderId: string) {
-    const reservation = await this.stockReservationRepository.findOneBy({
-      orderId,
+    return this.productsRepository.manager.transaction(async (manager) => {
+      await manager.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [orderId],
+      );
+      const reservation = await manager.findOneBy(StockReservation, {
+        orderId,
+      });
+      if (
+        !reservation ||
+        reservation.status === StockReservationStatus.RELEASED
+      )
+        return reservation;
+      const product = await manager.findOne(Product, {
+        where: { id: reservation.productId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (product) {
+        product.stockQuantity += reservation.quantity;
+        await manager.save(Product, product);
+      }
+      reservation.status = StockReservationStatus.RELEASED;
+      return manager.save(StockReservation, reservation);
     });
-
-    if (
-      !reservation ||
-      reservation.status === StockReservationStatus.RELEASED
-    ) {
-      return reservation;
-    }
-
-    const product = await this.productsRepository.findOneBy({
-      id: reservation.productId,
-    });
-
-    if (product) {
-      product.stockQuantity += reservation.quantity;
-      await this.productsRepository.save(product);
-    }
-
-    reservation.status = StockReservationStatus.RELEASED;
-    return this.stockReservationRepository.save(reservation);
   }
 
   async onOrderCreated(payload: WarehouseSagaPayload) {
+    let reservation: StockReservation;
     try {
-      const { reservation, created } = await this.reserveForSaga(payload);
-
-      if (created) {
-        await this.emit(this.billingQueue, 'warehouse.stock_reserved', {
-          orderId: payload.orderId,
-          customerId: payload.customerId,
-          productId: payload.productId,
-          quantity: payload.quantity,
-          amount: payload.amount,
-        });
-      }
-
-      return reservation;
+      ({ reservation } = await this.reserveForSaga(payload));
     } catch (error) {
+      if (
+        !(
+          error instanceof BadRequestException ||
+          error instanceof NotFoundException
+        )
+      )
+        throw error;
       await this.emit(this.orderQueue, 'warehouse.stock_failed', {
-        orderId: payload.orderId,
-        customerId: payload.customerId,
-        productId: payload.productId,
-        quantity: payload.quantity,
-        amount: payload.amount,
+        ...payload,
         reason: String(error),
       });
-
-      throw error;
+      return;
     }
+    // Replay the next event after a failed publication, without reserving twice.
+    if (reservation.status === StockReservationStatus.RESERVED) {
+      await this.emit(this.billingQueue, 'warehouse.stock_reserved', payload);
+    }
+    return reservation;
   }
 
   async onSagaFailure(payload: WarehouseSagaPayload) {

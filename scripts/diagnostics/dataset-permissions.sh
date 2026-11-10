@@ -8,11 +8,27 @@ dataset_sudo_owner() {
 }
 
 dataset_prepare_parent() {
-  local root_dir="$1" output_dir="$2" owner directory
+  local root_dir="$1" output_dir="$2" owner directory part relative
+  local -a directories parts
   owner="$(dataset_sudo_owner)"
   # Repair each ancestor before descending. A root-owned datasets/ with mode
   # 700 hides even a correctly owned run directory. Do not recurse into old runs.
-  for directory in "$root_dir/experiments" "$root_dir/experiments/datasets" "$(dirname "$output_dir")"; do
+  directory="$root_dir/experiments/datasets"
+  relative="$(dirname "$output_dir")"
+  [[ "$relative" == "$directory" || "$relative" == "$directory/"* ]] || {
+    echo '[datasets] Output must be inside experiments/datasets' >&2; return 1;
+  }
+  directories=("$root_dir/experiments" "$directory")
+  if [[ "$relative" != "$directory" ]]; then
+    relative="${relative#"$directory/"}"
+    IFS=/ read -r -a parts <<<"$relative"
+    for part in "${parts[@]}"; do
+      [[ -n "$part" && "$part" != . && "$part" != .. ]] || return 1
+      directory="$directory/$part"
+      directories+=("$directory")
+    done
+  fi
+  for directory in "${directories[@]}"; do
     if [[ -L "$directory" ]]; then
       echo "[datasets] Refusing a symlink in the output hierarchy: $directory" >&2
       return 1

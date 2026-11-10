@@ -1,21 +1,21 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import { Transport } from '@nestjs/microservices';
+import { HandledRmqServer } from './handled-rmq.server';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  app.enableShutdownHooks();
 
   app.connectMicroservice({
-    transport: Transport.RMQ,
-    options: {
+    strategy: new HandledRmqServer({
       urls: [process.env.RABBITMQ_URL ?? 'amqp://guest:guest@localhost:5672'],
       queue: 'order-saga-queue',
       queueOptions: {
         durable: true,
       },
       noAck: false,
-    },
+    }),
   });
 
   const swaggerConfig = new DocumentBuilder()

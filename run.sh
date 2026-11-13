@@ -36,6 +36,8 @@ ARCHITECTURE: distributed-baseline (default), tcc, two-phase-commit,
               orchestrated-saga, choreographed-saga.
 Other architectures use isolated stacks/volumes and the same collectors/charts.
 DB_POOL_MAX optionally overrides pool max; omitted preserves each implementation.
+DB_MODE=mock selects volatile storage on isolated stacks; requires PRELOAD_ORDERS=0.
+Use run-mock.sh for all five architectures without PostgreSQL or pool diagnostics.
 run-suite.sh runs architectures sequentially, with separate result directories.
 HELP
   exit 0
@@ -55,6 +57,12 @@ export K6_CSV_STORAGE="${K6_CSV_STORAGE:-disk}"
 export K6_CSV_TMPFS_ROOT="${K6_CSV_TMPFS_ROOT:-/dev/shm}"
 export SEED_DATA="${SEED_DATA:-auto}" BASE_URL=http://127.0.0.1:8000 WAREHOUSE_PREFIX=/warehouse
 export PRELOAD_ORDERS="${PRELOAD_ORDERS:-0}"
+export DB_MODE="${DB_MODE:-postgres}"
+[[ "$DB_MODE" == postgres || "$DB_MODE" == mock ]] || { echo 'Invalid DB_MODE' >&2; exit 1; }
+if [[ "$DB_MODE" == mock ]]; then
+  [[ "$PILOT_ISOLATED" == 1 && "$PRELOAD_ORDERS" == 0 ]] || { echo 'Mock requires isolated stack and PRELOAD_ORDERS=0' >&2; exit 1; }
+  export DB_DIAGNOSTICS=0
+fi
 export TZ=UTC
 export STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 AUTO_PLOT="${AUTO_PLOT:-1}"
@@ -261,8 +269,8 @@ root, out, csv_dir = map(pathlib.Path, sys.argv[1:])
 keys = ['RUN_ID','STARTED_AT','RATES','DURATION','WARMUP_DURATION','WARMUP_RATE','REPETITIONS',
         'SETTLING_SECONDS','COOLDOWN_SECONDS','RECOVERY_TIMEOUT_SECONDS',
         'PRE_ALLOCATED_VUS','MAX_VUS','DB_DIAGNOSTICS','COLLECT_HOST','SEED_DATA',
-        'K6_CSV_STORAGE','K6_CSV_TMPFS_ROOT','ARCHITECTURE','PILOT_ISOLATED','DB_POOL_MAX','COMPOSE_PROJECT_NAME','PRELOAD_ORDERS']
-data = {'architecture': os.environ['ARCHITECTURE'], 'database': 'postgres',
+        'K6_CSV_STORAGE','K6_CSV_TMPFS_ROOT','ARCHITECTURE','PILOT_ISOLATED','DB_POOL_MAX','COMPOSE_PROJECT_NAME','PRELOAD_ORDERS','DB_MODE']
+data = {'architecture': os.environ['ARCHITECTURE'], 'database': os.environ['DB_MODE'],
         'businessRecoveryPolicy': 'Record incomplete business recovery and continue cumulatively; pool recovery and asynchronous observation failures remain fatal.',
         'responseSemantics': 'HTTP acceptance; completion is asynchronous' if os.environ['ARCHITECTURE'] == 'choreographed-saga' else 'HTTP response after synchronous coordination',
         'environment': {k: os.environ.get(k) for k in keys},
@@ -270,6 +278,9 @@ data = {'architecture': os.environ['ARCHITECTURE'], 'database': 'postgres',
                       'availableBytesBeforeRun': os.statvfs(csv_dir).f_bavail * os.statvfs(csv_dir).f_frsize,
                       'exportPolicy': 'Copy tmpfs CSVs only after all load/recovery and child shutdown, before analysis.'},
         'datasetPolicy': 'Optional synthetic history, then cumulative warmup/benchmarks without resets' if int(os.environ['PRELOAD_ORDERS']) else 'Reuse volumes; seed only an empty catalog; ascending exploratory sweep without resets.'}
+if os.environ['DB_MODE'] == 'mock':
+    data['businessRecoveryPolicy'] = 'Bounded observation of order cohort in memory; no PostgreSQL pool or cross-service/broker invariant audit.'
+    data['datasetPolicy'] = 'Fresh volatile state per service process; HTTP seed; cumulative warmup/benchmarks; no SQL preload.'
 (out/'metadata.json').write_text(json.dumps(data, indent=2)+'\n')
 files = [root/'run.sh', root/'experiments/k6/pilot.js', root/'experiments/analyze_pilot.py',
          root/'scripts/seed.sh', root/'scripts/diagnostics/collect-postgres.py',
@@ -280,7 +291,7 @@ for service in ['order','warehouse','billing','shipping']:
     files += [p for p in [base/'package.json', base/'pnpm-lock.yaml', base/'Dockerfile'] if p.exists()]
 if os.environ['PILOT_ISOLATED'] == '1':
     files += list((root/'implementation/distributed-baseline/order-service/src/diagnostics').glob('*.ts'))
-    files += list((root/'environment/pilot').glob('*')) + list((root/'scripts/pilot').glob('*.py'))
+    files += list((root/'environment/pilot').glob('*')) + list((root/'environment/mock').glob('*')) + list((root/'scripts/pilot').glob('*.py'))
     if (root/'.dockerignore').exists(): files.append(root/'.dockerignore')
 files += list((root/'environment/compose').glob('*.yaml'))
 (out/'source-sha256.json').write_text(json.dumps({str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -289,6 +300,7 @@ PY
 mark startup
 current_log="$OUT/logs/startup.log"
 "${COMPOSE[@]}" build >"$current_log" 2>&1
+if [[ "$DB_MODE" != mock ]]; then
 "${COMPOSE[@]}" up --detach order-db warehouse-db billing-db shipping-db >>"$current_log" 2>&1
 deadline=$((SECONDS + 600))
 for service in order warehouse billing shipping; do
@@ -299,6 +311,7 @@ for service in order warehouse billing shipping; do
     sleep 2
   done
 done
+fi
 "${COMPOSE[@]}" up --detach --no-build >>"$current_log" 2>&1
 "${COMPOSE[@]}" logs --follow --no-color --timestamps --since "$STARTED_AT" \
   >"$OUT/application.log" 2>&1 &
@@ -334,9 +347,11 @@ if (( PRELOAD_ORDERS > 0 )); then
 fi
 mark collectors
 current_log="$OUT/postgres-collector.log"
+if [[ "$DB_MODE" != mock ]]; then
 python3 "$ROOT_DIR/scripts/diagnostics/collect-postgres.py" --output-dir "$OUT" \
   --run-id "$RUN_ID" --compose "$BASE" >"$current_log" 2>&1 &
 postgres_pid=$!; children+=("$postgres_pid")
+fi
 if [[ "$COLLECT_HOST" == 1 ]]; then
   python3 "$ROOT_DIR/scripts/diagnostics/collect-host.py" --output-dir "$OUT" \
     --run-id "$RUN_ID" --compose "$BASE" >"$OUT/host-collector.log" 2>&1 &
@@ -346,12 +361,14 @@ if [[ "$COLLECT_HOST" == 1 ]]; then
     children+=("$!")
   else echo 'iostat unavailable (sysstat package)' >"$OUT/iostat-unavailable.txt"; fi
 fi
+if [[ "$DB_MODE" != mock ]]; then
 for ((attempt=0; attempt<15; attempt++)); do
   [[ -s "$OUT/postgres-activity.jsonl" ]] && break
   kill -0 "$postgres_pid" 2>/dev/null || fail 'PostgreSQL collector exited'
   sleep 1
 done
 [[ -s "$OUT/postgres-activity.jsonl" ]] || fail 'PostgreSQL collector produced no samples'
+fi
 run_stage() {
   local prefix="$1" rate="$2" duration="$3" repetition="$4" kind="$5" code=0 began=$SECONDS child
   mark "$prefix"
@@ -362,7 +379,7 @@ run_stage() {
   local load_pid=$!; children+=("$load_pid")
   while kill -0 "$load_pid" 2>/dev/null; do
     sleep 5
-    kill -0 "$postgres_pid" 2>/dev/null || fail 'PostgreSQL collector stopped during stage'
+    if [[ "$DB_MODE" != mock ]]; then kill -0 "$postgres_pid" 2>/dev/null || fail 'PostgreSQL collector stopped during stage'; fi
     if (( (SECONDS - began) / 5 % 3 == 0 )); then
       echo "[pilot] $prefix: $rate pedidos/s, elapsed=$((SECONDS - began))s; log=$current_log"
     fi
@@ -376,7 +393,7 @@ run_stage() {
   printf '%d\n' "$code" >"$OUT/${prefix}.exit-code.txt"
   (( code == 0 )) || return "$code"
   [[ -s "$OUT/$prefix.json" ]] || fail "Missing k6 summary: $prefix"
-  kill -0 "$postgres_pid" 2>/dev/null || fail 'PostgreSQL collector stopped during stage'
+  if [[ "$DB_MODE" != mock ]]; then kill -0 "$postgres_pid" 2>/dev/null || fail 'PostgreSQL collector stopped during stage'; fi
 }
 previous_business_snapshot=""
 recover() {
@@ -408,9 +425,15 @@ sys.exit(0 if age < 5 and last["pool"]["inUse"] == 0 and last["pool"]["waiting"]
       extra=(--wait-seconds "$RECOVERY_TIMEOUT_SECONDS" --broker)
       if [[ -n "$previous_business_snapshot" ]]; then extra+=(--previous "$previous_business_snapshot"); fi
     fi
+    if [[ "$DB_MODE" == mock ]]; then
+      python3 "$ROOT_DIR/scripts/pilot/mock_state.py" --compose "$BASE" \
+        --customer-prefix "customer-k6-$ARCHITECTURE-$RUN_ID-$stage-" \
+        --output "$OUT/business/$stage.json" --wait-seconds "$RECOVERY_TIMEOUT_SECONDS"
+    else
     python3 "$ROOT_DIR/scripts/pilot/state.py" --compose "$BASE" \
       --customer-prefix "customer-k6-$ARCHITECTURE-$RUN_ID-$stage-" \
       --output "$OUT/business/$stage.json" "${extra[@]}"
+    fi
     previous_business_snapshot="$OUT/business/$stage.json"
   fi
 }

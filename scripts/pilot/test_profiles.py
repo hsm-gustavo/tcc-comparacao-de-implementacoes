@@ -23,6 +23,19 @@ class ProfileTest(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.out=Path(self.tmp.name)
 
+    def test_mock_removes_postgres_for_all_five_architectures(self):
+        with patch.dict(os.environ, DB_MODE='mock'):
+            for architecture in compose.ARCHITECTURES:
+                model = compose.generate(architecture, 'mock-' + architecture, self.out / architecture)
+                self.assertFalse(any(name.endswith('-db') for name in model['services']))
+                self.assertFalse(any(name.endswith('-data') and name != 'rabbitmq-data' for name in model['volumes']))
+                for name in ['order', 'warehouse', 'billing', 'shipping']:
+                    service = model['services'][name + '-service']
+                    self.assertEqual(service['environment']['DB_MODE'], 'mock')
+                    self.assertEqual(service['environment']['DB_DIAGNOSTICS'], '0')
+                    self.assertNotIn(name + '-db', service['depends_on'])
+                self.assertEqual('rabbitmq' in model['services'], architecture == 'choreographed-saga')
+
     def test_unique_projects_no_fixed_container_names_or_exposed_database_ports(self):
         names=set()
         for architecture in compose.ARCHITECTURES:

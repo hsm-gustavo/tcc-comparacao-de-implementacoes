@@ -26,6 +26,7 @@ def generate(architecture, run_id, output, root=ROOT):
                                   f'proxy_pass http://{service}_cluster/;')
     (output / 'nginx.conf').write_text(nginx)
     services, volumes = {}, {}
+    mock = os.environ.get('DB_MODE', 'postgres') == 'mock'
     for index, service in enumerate(('order', 'warehouse', 'billing', 'shipping'), 3001):
         db = service + '-db'
         volumes[service + '-data'] = {}
@@ -38,12 +39,18 @@ def generate(architecture, run_id, output, root=ROOT):
         env = {'POSTGRES_HOST': db, 'POSTGRES_PORT': '5432', 'PORT': str(index),
                'RUN_ID': run_id, 'DB_DIAGNOSTICS': os.environ.get('DB_DIAGNOSTICS', '1'),
                'PILOT_INJECT_DIAGNOSTICS': '1' if service == 'order' and architecture != 'distributed-baseline' else '0'}
+        if mock:
+            env.update(DB_MODE='mock', DB_DIAGNOSTICS='0')
         if os.environ.get('DB_POOL_MAX'):
             env['DB_POOL_MAX'] = os.environ['DB_POOL_MAX']
         if service == 'order':
             env.update(WAREHOUSE_URL='http://distributed-lb/warehouse',
                        BILLING_URL='http://distributed-lb/billing', SHIPPING_URL='http://distributed-lb/shipping')
         dependencies = {db: {'condition': 'service_healthy'}}
+        if mock:
+            del services[db]
+            del volumes[service + '-data']
+            dependencies = {}
         if architecture == 'choreographed-saga':
             env['RABBITMQ_URL'] = 'amqp://pilot:pilot@rabbitmq:5672'
             dependencies['rabbitmq'] = {'condition': 'service_healthy'}

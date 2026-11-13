@@ -24,5 +24,6 @@ COPY --chown=node:node --from=builder /usr/src/app/package.json ./
 COPY --chown=node:node --from=builder /usr/src/app/node_modules ./node_modules
 COPY --chown=node:node --from=builder /usr/src/app/dist ./dist
 COPY --chown=node:node environment/pilot/register-diagnostics.cjs ./pilot/register-diagnostics.cjs
+COPY --chown=node:node environment/mock/ ./mock/
 USER node
-CMD ["node", "--require", "./pilot/register-diagnostics.cjs", "dist/main.js"]
+CMD ["node", "--require", "./mock/register.cjs", "--require", "./pilot/register-diagnostics.cjs", "dist/main.js"]

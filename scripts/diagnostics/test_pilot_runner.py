@@ -23,6 +23,7 @@ class PilotRunnerTest(unittest.TestCase):
         for name in ('run.sh', 'experiments/k6/pilot.js', 'experiments/analyze_pilot.py',
                      'scripts/seed.sh', 'scripts/diagnostics/dataset-permissions.sh',
                      'scripts/pilot/compose.py', 'scripts/pilot/state.py', 'scripts/pilot/preload.py',
+                     'scripts/pilot/mock_state.py',
                      'environment/nginx/distributed.conf', 'environment/pilot/Dockerfile',
                      'environment/pilot/pnpm-workspace.yaml',
                      'environment/pilot/register-diagnostics.cjs'):
@@ -68,6 +69,8 @@ if 'build' in sys.argv:
     sys.exit(int(os.environ['FAKE_BUILD_EXIT']))
 if 'inspect' in sys.argv: print('healthy')
 if 'ps' in sys.argv and '--quiet' in sys.argv: print('fixture-db-id')
+if 'exec' in sys.argv and 'node' in sys.argv:
+    print(json.dumps({'counts': {'confirmed': 1}, 'tables': {'Order': 1}, 'database': 'mock'}))
 if 'exec' in sys.argv and 'psql' in sys.argv:
     if os.environ.get('FAKE_STATE_EXIT') == '3':
         print('ERROR: canceling statement due to statement timeout', file=sys.stderr)
@@ -398,6 +401,20 @@ shutil.copyfile(source, destination)
                 self.assertNotIn('container_name', model['services']['order-db'])
                 self.assertEqual('rabbitmq' in model['services'], architecture == 'choreographed-saga')
                 self.assertEqual(json.loads((out/'status.json').read_text())['containerStop'], 'stopped')
+
+    def test_mock_runner_never_starts_or_collects_postgres(self):
+        result = self.run_runner(DB_MODE='mock', ARCHITECTURE='choreographed-saga', PILOT_ISOLATED='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metadata = json.loads((self.output/'metadata.json').read_text())
+        self.assertEqual(metadata['database'], 'mock')
+        self.assertEqual(metadata['environment']['DB_DIAGNOSTICS'], '0')
+        self.assertFalse((self.output/'postgres-activity.jsonl').exists())
+        calls = [json.loads(line) for line in (self.root/'docker-calls.jsonl').read_text().splitlines()]
+        self.assertFalse(any('psql' in call or 'order-db' in call or 'inspect' in call for call in calls))
+        self.assertTrue(any('down' in call for call in calls))
+        self.assertFalse(any('--volumes' in call or '-v' in call for call in calls))
+        self.assertTrue((self.output/'business/rate2_run1.json').exists())
+        self.assertTrue((self.output/'analysis/levels.csv').exists())
 
     def test_failed_diagnostic_snapshot_does_not_abort_synchronous_load_stages(self):
         result = self.run_runner(ARCHITECTURE='orchestrated-saga', PILOT_ISOLATED='1',

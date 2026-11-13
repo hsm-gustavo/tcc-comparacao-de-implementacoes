@@ -13,3 +13,4 @@ experiments/datasets/faults
 scripts/diagnostics/*.md
 docs/
 artifacts/
+*.md

@@ -9,6 +9,14 @@ import sys
 
 from analyze_pilot import enrich_http_metrics, percentile, read_table, summarize_repetitions, write_csv
 
+ARCHITECTURE_LABELS = {
+    'distributed-baseline': 'Arquitetura de referência',
+    'tcc': 'Try-Confirm/Cancel',
+    'two-phase-commit': 'Two-Phase Commit (2PC)',
+    'orchestrated-saga': 'Saga orquestrada',
+    'choreographed-saga': 'Saga coreografada',
+}
+
 
 def effective_pool(root):
     path = root / 'application.log'
@@ -134,7 +142,7 @@ def plot(rows, runs, output, campaign_boundary=None):
                              and r['median'] is not None), key=lambda r: r['rate'])
             if not values:
                 continue
-            label = name + (' (aceitação HTTP)' if name == 'choreographed-saga' and metric != 'confirmed_pct' else '')
+            label = ARCHITECTURE_LABELS.get(name, name)
             x = [r['rate'] for r in values]
             line, = ax.plot(x, [r['median'] * scale for r in values], 'o-', label=label)
             ax.fill_between(x, [r['p25'] * scale for r in values],

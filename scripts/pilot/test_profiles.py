@@ -36,6 +36,19 @@ class ProfileTest(unittest.TestCase):
                     self.assertNotIn(name + '-db', service['depends_on'])
                 self.assertEqual('rabbitmq' in model['services'], architecture == 'choreographed-saga')
 
+    def test_startup_checks_tcp_database_and_gives_broker_boot_grace(self):
+        with patch.dict(os.environ,DB_START_TIMEOUT_SECONDS='1800',BROKER_START_TIMEOUT_SECONDS='2400'):
+            model=compose.generate('choreographed-saga','startup',self.out/'startup')
+        for name in ['order','warehouse','billing','shipping']:
+            health=model['services'][name+'-db']['healthcheck']
+            self.assertIn('-h 127.0.0.1',health['test'][1])
+            self.assertIn('SELECT 1',health['test'][1])
+            self.assertIn('$${POSTGRES_DB}',health['test'][1])
+            self.assertEqual(health['start_period'],'120s')
+            self.assertEqual(health['retries'],600)
+        self.assertEqual(model['services']['rabbitmq']['healthcheck']['retries'],480)
+        self.assertEqual(model['services']['rabbitmq']['healthcheck']['start_period'],'120s')
+
     def test_unique_projects_no_fixed_container_names_or_exposed_database_ports(self):
         names=set()
         for architecture in compose.ARCHITECTURES:

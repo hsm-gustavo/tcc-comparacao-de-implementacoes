@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 ARCHITECTURES = ('distributed-baseline', 'tcc', 'two-phase-commit',
@@ -15,6 +16,16 @@ def generate(architecture, run_id, output, root=ROOT):
     if architecture not in ARCHITECTURES:
         raise ValueError(f'Unsupported architecture: {architecture}')
     project = 'pilot-' + architecture + '-' + hashlib.sha256(run_id.encode()).hexdigest()[:10]
+    image_prefix = os.environ.get('PILOT_IMAGE_PREFIX')
+    if image_prefix and not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,100}', image_prefix):
+        raise ValueError('Invalid isolated image prefix')
+    def startup_budget(name):
+        value = os.environ.get(name, '1800')
+        if not re.fullmatch(r'[1-9][0-9]{0,6}', value):
+            raise ValueError(f'Invalid {name}')
+        return int(value)
+    db_budget = startup_budget('DB_START_TIMEOUT_SECONDS')
+    broker_budget = startup_budget('BROKER_START_TIMEOUT_SECONDS')
     output.mkdir(exist_ok=True)
     nginx = (root / 'environment/nginx/distributed.conf').read_text()
     legacy = architecture in ('tcc', 'two-phase-commit', 'choreographed-saga')
@@ -34,8 +45,8 @@ def generate(architecture, run_id, output, root=ROOT):
             'image': 'postgres:15-alpine', 'restart': 'unless-stopped',
             'environment': {'POSTGRES_DB': service, 'POSTGRES_USER': 'user', 'POSTGRES_PASSWORD': 'password'},
             'volumes': [f'{service}-data:/var/lib/postgresql/data'],
-            'healthcheck': {'test': ['CMD-SHELL', f'pg_isready -U user -d {service}'],
-                            'interval': '3s', 'timeout': '5s', 'retries': 10, 'start_period': '15s'}}
+            'healthcheck': {'test': ['CMD-SHELL', 'PGPASSWORD="$${POSTGRES_PASSWORD}" PGCONNECT_TIMEOUT=5 psql -X -w -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" -Atqc "SELECT 1" | grep -qx 1'],
+                            'interval': '3s', 'timeout': '10s', 'retries': max(10, (db_budget + 2) // 3), 'start_period': '120s'}}
         env = {'POSTGRES_HOST': db, 'POSTGRES_PORT': '5432', 'PORT': str(index),
                'RUN_ID': run_id, 'DB_DIAGNOSTICS': os.environ.get('DB_DIAGNOSTICS', '1'),
                'PILOT_INJECT_DIAGNOSTICS': '1' if service == 'order' and architecture != 'distributed-baseline' else '0'}
@@ -58,12 +69,14 @@ def generate(architecture, run_id, output, root=ROOT):
             'build': {'context': str(root), 'dockerfile': 'environment/pilot/Dockerfile',
                       'args': {'ARCHITECTURE': architecture, 'SERVICE': service}},
             'restart': 'unless-stopped', 'environment': env, 'depends_on': dependencies}
+        if image_prefix:
+            services[service + '-service']['image'] = f'{image_prefix}-{service}:latest'
     if architecture == 'choreographed-saga':
         services['rabbitmq'] = {'image': 'rabbitmq:4-management', 'restart': 'unless-stopped',
                                'environment': {'RABBITMQ_DEFAULT_USER': 'pilot', 'RABBITMQ_DEFAULT_PASS': 'pilot'},
                                'volumes': ['rabbitmq-data:/var/lib/rabbitmq'],
                                'healthcheck': {'test': ['CMD', 'rabbitmq-diagnostics', '-q', 'ping'],
-                                               'interval': '5s', 'timeout': '5s', 'retries': 30}}
+                                               'interval': '5s', 'timeout': '10s', 'retries': max(30, (broker_budget + 4) // 5), 'start_period': '120s'}}
         volumes['rabbitmq-data'] = {}
     services['distributed-lb'] = {
         'image': 'nginx:alpine', 'restart': 'unless-stopped', 'ports': ['8000:80'],

@@ -38,6 +38,10 @@ Other architectures use isolated stacks/volumes and the same collectors/charts.
 DB_POOL_MAX optionally overrides pool max; omitted preserves each implementation.
 DB_MODE=mock selects volatile storage on isolated stacks; requires PRELOAD_ORDERS=0.
 Use run-mock.sh for all five architectures without PostgreSQL or pool diagnostics.
+Startup budgets (seconds): DB_START_TIMEOUT_SECONDS=1800, BROKER_START_TIMEOUT_SECONDS=1800,
+HTTP_START_TIMEOUT_SECONDS=600, SEED_TIMEOUT_SECONDS=600,
+COLLECTOR_START_TIMEOUT_SECONDS=120, SETUP_HTTP_TIMEOUT_SECONDS=60.
+These do not change workload HTTP, pool acquisition or recovery timeouts.
 run-suite.sh runs architectures sequentially, with separate result directories.
 HELP
   exit 0
@@ -52,6 +56,12 @@ export WARMUP_RATE="${WARMUP_RATE:-1}" REPETITIONS="${REPETITIONS:-1}"
 export SETTLING_SECONDS="${SETTLING_SECONDS:-30}"
 export COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-30}"
 export RECOVERY_TIMEOUT_SECONDS="${RECOVERY_TIMEOUT_SECONDS:-60}"
+export DB_START_TIMEOUT_SECONDS="${DB_START_TIMEOUT_SECONDS:-1800}"
+export BROKER_START_TIMEOUT_SECONDS="${BROKER_START_TIMEOUT_SECONDS:-1800}"
+export HTTP_START_TIMEOUT_SECONDS="${HTTP_START_TIMEOUT_SECONDS:-600}"
+export SEED_TIMEOUT_SECONDS="${SEED_TIMEOUT_SECONDS:-600}"
+export COLLECTOR_START_TIMEOUT_SECONDS="${COLLECTOR_START_TIMEOUT_SECONDS:-120}"
+export SETUP_HTTP_TIMEOUT_SECONDS="${SETUP_HTTP_TIMEOUT_SECONDS:-60}"
 export DB_DIAGNOSTICS="${DB_DIAGNOSTICS:-1}" COLLECT_HOST="${COLLECT_HOST:-1}"
 export K6_CSV_STORAGE="${K6_CSV_STORAGE:-disk}"
 export K6_CSV_TMPFS_ROOT="${K6_CSV_TMPFS_ROOT:-/dev/shm}"
@@ -73,6 +83,13 @@ if [[ -n "${PILOT_SUITE_ID:-}" ]]; then
   [[ "$PILOT_SUITE_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,59}$ ]] || { echo 'Invalid PILOT_SUITE_ID' >&2; exit 1; }
   OUT="$ROOT_DIR/experiments/datasets/pilot/$PILOT_SUITE_ID/$ARCHITECTURE"
 fi
+if [[ -n "${PILOT_TRIAL_ID:-}" ]]; then
+  [[ "$PILOT_ISOLATED" == 1 && -n "${PILOT_SUITE_ID:-}" && "$PILOT_TRIAL_ID" =~ ^rate[1-9][0-9]*_run[1-9][0-9]*$ ]] || { echo 'Invalid isolated trial ID' >&2; exit 1; }
+  OUT="$OUT/trials/$PILOT_TRIAL_ID"
+fi
+export PILOT_REPETITION_START="${PILOT_REPETITION_START:-1}"
+[[ "$PILOT_REPETITION_START" =~ ^[1-9][0-9]{0,6}$ ]] || { echo 'Invalid repetition start' >&2; exit 1; }
+[[ "${PILOT_SKIP_BUILD:-0}" =~ ^[01]$ ]] || { echo 'Invalid skip-build flag' >&2; exit 1; }
 BASE="$ROOT_DIR/environment/compose/compose.base.yaml"
 COMPOSE=(docker compose -f "$BASE" -f "$ROOT_DIR/environment/compose/compose.diagnostics.yaml")
 fail() { echo "[pilot] $*" >&2; exit 1; }
@@ -100,9 +117,12 @@ for rate in "${rates[@]}"; do
 done
 export PRE_ALLOCATED_VUS="${PRE_ALLOCATED_VUS:-$((previous * 25))}"
 export MAX_VUS="${MAX_VUS:-$PRE_ALLOCATED_VUS}"
-for name in WARMUP_RATE REPETITIONS PRE_ALLOCATED_VUS MAX_VUS RECOVERY_TIMEOUT_SECONDS; do
+for name in WARMUP_RATE REPETITIONS PRE_ALLOCATED_VUS MAX_VUS RECOVERY_TIMEOUT_SECONDS DB_START_TIMEOUT_SECONDS BROKER_START_TIMEOUT_SECONDS HTTP_START_TIMEOUT_SECONDS SEED_TIMEOUT_SECONDS COLLECTOR_START_TIMEOUT_SECONDS SETUP_HTTP_TIMEOUT_SECONDS; do
   [[ "${!name}" =~ ^[1-9][0-9]{0,6}$ ]] || fail "$name must be a positive integer"
 done
+if [[ -n "${PILOT_TRIAL_ID:-}" ]]; then
+  [[ "$REPETITIONS" == 1 && "$PRELOAD_ORDERS" == 0 && "$PILOT_TRIAL_ID" == "rate${RATES}_run${PILOT_REPETITION_START}" ]] || fail 'Independent child must contain exactly its declared trial and no preload'
+fi
 for name in SETTLING_SECONDS COOLDOWN_SECONDS; do
   [[ "${!name}" =~ ^(0|[1-9][0-9]{0,6})$ ]] || fail "$name must be a nonnegative integer"
 done
@@ -269,7 +289,10 @@ root, out, csv_dir = map(pathlib.Path, sys.argv[1:])
 keys = ['RUN_ID','STARTED_AT','RATES','DURATION','WARMUP_DURATION','WARMUP_RATE','REPETITIONS',
         'SETTLING_SECONDS','COOLDOWN_SECONDS','RECOVERY_TIMEOUT_SECONDS',
         'PRE_ALLOCATED_VUS','MAX_VUS','DB_DIAGNOSTICS','COLLECT_HOST','SEED_DATA',
-        'K6_CSV_STORAGE','K6_CSV_TMPFS_ROOT','ARCHITECTURE','PILOT_ISOLATED','DB_POOL_MAX','COMPOSE_PROJECT_NAME','PRELOAD_ORDERS','DB_MODE']
+        'K6_CSV_STORAGE','K6_CSV_TMPFS_ROOT','ARCHITECTURE','PILOT_ISOLATED','DB_POOL_MAX','COMPOSE_PROJECT_NAME','PRELOAD_ORDERS','DB_MODE',
+        'PILOT_TRIAL_ID','PILOT_REPETITION_START','PILOT_SKIP_BUILD','PILOT_IMAGE_PREFIX',
+        'DB_START_TIMEOUT_SECONDS','BROKER_START_TIMEOUT_SECONDS','HTTP_START_TIMEOUT_SECONDS',
+        'SEED_TIMEOUT_SECONDS','COLLECTOR_START_TIMEOUT_SECONDS','SETUP_HTTP_TIMEOUT_SECONDS']
 data = {'architecture': os.environ['ARCHITECTURE'], 'database': os.environ['DB_MODE'],
         'businessRecoveryPolicy': 'Record incomplete business recovery and continue cumulatively; pool recovery and asynchronous observation failures remain fatal.',
         'responseSemantics': 'HTTP acceptance; completion is asynchronous' if os.environ['ARCHITECTURE'] == 'choreographed-saga' else 'HTTP response after synchronous coordination',
@@ -299,44 +322,77 @@ files += list((root/'environment/compose').glob('*.yaml'))
 PY
 mark startup
 current_log="$OUT/logs/startup.log"
-"${COMPOSE[@]}" build >"$current_log" 2>&1
-if [[ "$DB_MODE" != mock ]]; then
-"${COMPOSE[@]}" up --detach order-db warehouse-db billing-db shipping-db >>"$current_log" 2>&1
-deadline=$((SECONDS + 600))
-for service in order warehouse billing shipping; do
-  container="$service-db"
-  if [[ "$PILOT_ISOLATED" == 1 ]]; then container="$("${COMPOSE[@]}" ps --all --quiet "$service-db")"; fi
-  until [[ "$(docker inspect --format '{{.State.Health.Status}}' "$container")" == healthy ]]; do
-    (( SECONDS < deadline )) || fail "Database initialization timeout: $service-db"
+wait_service_ready() {
+  local service="$1" deadline="$2" database="${3:-}" health id probe next_progress=$SECONDS
+  local log="$OUT/logs/readiness-$service.log"
+  while (( SECONDS < deadline )); do
+    id="$(timeout --foreground 15 "${COMPOSE[@]}" ps --all --quiet "$service" 2>>"$log")" || id=''
+    health='unavailable'
+    if [[ -n "$id" ]]; then
+      health="$(timeout --foreground 15 docker inspect --format '{{.State.Health.Status}}' "$id" 2>>"$log")" || health='unavailable'
+    fi
+    if [[ "$health" == healthy ]]; then
+      if [[ -z "$database" ]]; then return 0; fi
+      # A Unix socket can belong to initdb's temporary server. Require TCP and
+      # the actual target database, with limits only on this disposable probe.
+      probe="$(timeout --foreground 15 "${COMPOSE[@]}" exec -T \
+        -e PGPASSWORD=password -e PGCONNECT_TIMEOUT=5 -e 'PGOPTIONS=-c statement_timeout=5000' \
+        "$service" psql -X -w -h 127.0.0.1 -U user -d "$database" -Atqc 'SELECT 1' 2>>"$log")" || probe=''
+      if [[ "$probe" == 1 ]]; then return 0; fi
+    fi
+    if (( SECONDS >= next_progress )); then
+      echo "[pilot] Waiting for $service (health=$health; remaining=$((deadline-SECONDS))s); log=$log"
+      next_progress=$((SECONDS + 15))
+    fi
     sleep 2
   done
+  timeout --foreground 15 "${COMPOSE[@]}" ps --all >>"$log" 2>&1 || true
+  timeout --foreground 15 "${COMPOSE[@]}" logs --no-color --tail 100 "$service" >>"$log" 2>&1 || true
+  fail "Startup timeout: $service; see $log"
+}
+if [[ "${PILOT_SKIP_BUILD:-0}" == 0 ]]; then
+  "${COMPOSE[@]}" build >"$current_log" 2>&1
+  printf '{"built":true}\n' >"$OUT/build-completed.json"
+else
+  echo '[pilot] Reusing suite images; build skipped' >"$current_log"
+fi
+if [[ "$DB_MODE" != mock ]]; then
+deadline=$((SECONDS + DB_START_TIMEOUT_SECONDS))
+timeout --foreground "$DB_START_TIMEOUT_SECONDS" "${COMPOSE[@]}" up --detach order-db warehouse-db billing-db shipping-db >>"$current_log" 2>&1
+for service in order warehouse billing shipping; do
+  wait_service_ready "$service-db" "$deadline" "$service"
 done
 fi
-"${COMPOSE[@]}" up --detach --no-build >>"$current_log" 2>&1
+if [[ "$ARCHITECTURE" == choreographed-saga ]]; then
+  deadline=$((SECONDS + BROKER_START_TIMEOUT_SECONDS))
+  timeout --foreground "$BROKER_START_TIMEOUT_SECONDS" "${COMPOSE[@]}" up --detach rabbitmq >>"$current_log" 2>&1
+  wait_service_ready rabbitmq "$deadline"
+fi
+deadline=$((SECONDS + HTTP_START_TIMEOUT_SECONDS))
+timeout --foreground "$HTTP_START_TIMEOUT_SECONDS" "${COMPOSE[@]}" up --detach --no-build >>"$current_log" 2>&1
 "${COMPOSE[@]}" logs --follow --no-color --timestamps --since "$STARTED_AT" \
   >"$OUT/application.log" 2>&1 &
 children+=("$!")
 mark readiness
-deadline=$((SECONDS + 180))
 for service in order warehouse billing shipping; do
   until curl -fsS --connect-timeout 2 --max-time 5 "$BASE_URL/$service/health" >/dev/null 2>&1; do
-    (( SECONDS < deadline )) || fail "HTTP readiness timeout: $service"
+    (( SECONDS < deadline )) || fail "HTTP readiness timeout: $service; see logs/startup.log and application.log"
     sleep 1
   done
 done
 mark dataset
-curl -fsS --max-time 10 "$BASE_URL/warehouse/products" >"$OUT/initial-products.json"
+curl -fsS --max-time "$SETUP_HTTP_TIMEOUT_SECONDS" "$BASE_URL/warehouse/products" >"$OUT/initial-products.json"
 catalog_size="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$OUT/initial-products.json")"
 if [[ "$catalog_size" == 0 && "$SEED_DATA" != 0 ]]; then
   current_log="$OUT/logs/seed.log"
-  timeout --foreground 180 bash "$ROOT_DIR/scripts/seed.sh" distributed >"$current_log" 2>&1
+  timeout --foreground "$SEED_TIMEOUT_SECONDS" bash "$ROOT_DIR/scripts/seed.sh" distributed >"$current_log" 2>&1
 elif [[ "$catalog_size" != 0 && "$SEED_DATA" == 1 ]]; then
   fail 'Catalog is not empty; refusing duplicate seed. Use SEED_DATA=auto or 0.'
 elif [[ "$catalog_size" == 0 ]]; then
   fail 'Catalog is empty and SEED_DATA=0'
 fi
 if [[ "$PILOT_ISOLATED" == 1 ]]; then
-  curl -fsS --max-time 10 "$BASE_URL/warehouse/products" >"$OUT/catalog-used.json"
+  curl -fsS --max-time "$SETUP_HTTP_TIMEOUT_SECONDS" "$BASE_URL/warehouse/products" >"$OUT/catalog-used.json"
 fi
 if (( PRELOAD_ORDERS > 0 )); then
   mark preload
@@ -362,7 +418,8 @@ if [[ "$COLLECT_HOST" == 1 ]]; then
   else echo 'iostat unavailable (sysstat package)' >"$OUT/iostat-unavailable.txt"; fi
 fi
 if [[ "$DB_MODE" != mock ]]; then
-for ((attempt=0; attempt<15; attempt++)); do
+deadline=$((SECONDS + COLLECTOR_START_TIMEOUT_SECONDS))
+while (( SECONDS < deadline )); do
   [[ -s "$OUT/postgres-activity.jsonl" ]] && break
   kill -0 "$postgres_pid" 2>/dev/null || fail 'PostgreSQL collector exited'
   sleep 1
@@ -440,7 +497,7 @@ sys.exit(0 if age < 5 and last["pool"]["inUse"] == 0 and last["pool"]["waiting"]
 run_stage warmup "$WARMUP_RATE" "$WARMUP_DURATION" 0 warmup
 recover warmup
 for rate in "${rates[@]}"; do
-  for ((repetition=1; repetition<=REPETITIONS; repetition++)); do
+  for ((repetition=PILOT_REPETITION_START; repetition<PILOT_REPETITION_START+REPETITIONS; repetition++)); do
     echo "[pilot] Rate=$rate requests/s; repetition=$repetition/$REPETITIONS"
     run_stage "rate${rate}_run${repetition}" "$rate" "$DURATION" "$repetition" benchmark
     recover "rate${rate}_run${repetition}"

@@ -67,11 +67,18 @@ with (pathlib.Path(os.environ['FAKE_ROOT'])/'docker-calls.jsonl').open('a') as s
 if 'build' in sys.argv:
     print('fixture build')
     sys.exit(int(os.environ['FAKE_BUILD_EXIT']))
-if 'inspect' in sys.argv: print('healthy')
-if 'ps' in sys.argv and '--quiet' in sys.argv: print('fixture-db-id')
+if 'inspect' in sys.argv: print('unhealthy' if os.environ.get('FAKE_BROKER_UNHEALTHY') and sys.argv[-1]=='fixture-rabbitmq-id' else 'healthy')
+if 'ps' in sys.argv and '--quiet' in sys.argv: print('fixture-rabbitmq-id' if 'rabbitmq' in sys.argv else 'fixture-db-id')
 if 'exec' in sys.argv and 'node' in sys.argv:
     print(json.dumps({'counts': {'confirmed': 1}, 'tables': {'Order': 1}, 'database': 'mock'}))
 if 'exec' in sys.argv and 'psql' in sys.argv:
+    if 'SELECT 1' in sys.argv:
+        counter=pathlib.Path(os.environ['FAKE_ROOT'])/'probe-count.txt'
+        n=int(counter.read_text())+1 if counter.exists() else 1
+        counter.write_text(str(n))
+        if n<=int(os.environ.get('FAKE_DB_PROBE_FAILURES','0')):
+            print('TCP not ready',file=sys.stderr);sys.exit(1)
+        print('1');sys.exit(0)
     if os.environ.get('FAKE_STATE_EXIT') == '3':
         print('ERROR: canceling statement due to statement timeout', file=sys.stderr)
         sys.exit(3)
@@ -410,11 +417,52 @@ shutil.copyfile(source, destination)
         self.assertEqual(metadata['environment']['DB_DIAGNOSTICS'], '0')
         self.assertFalse((self.output/'postgres-activity.jsonl').exists())
         calls = [json.loads(line) for line in (self.root/'docker-calls.jsonl').read_text().splitlines()]
-        self.assertFalse(any('psql' in call or 'order-db' in call or 'inspect' in call for call in calls))
+        self.assertFalse(any('psql' in call or 'order-db' in call for call in calls))
         self.assertTrue(any('down' in call for call in calls))
         self.assertFalse(any('--volumes' in call or '-v' in call for call in calls))
         self.assertTrue((self.output/'business/rate2_run1.json').exists())
         self.assertTrue((self.output/'analysis/levels.csv').exists())
+
+    def test_independent_child_seeds_warms_up_and_uses_actual_repetition(self):
+        result = self.run_runner(ARCHITECTURE='tcc', PILOT_ISOLATED='1', PILOT_SUITE_ID='independent-test',
+                                 PILOT_TRIAL_ID='rate1_run3', PILOT_REPETITION_START='3', RATES='1',
+                                 PILOT_IMAGE_PREFIX='independent-fixture', PILOT_SKIP_BUILD='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        out = self.output.parent/'independent-test/tcc/trials/rate1_run3'
+        self.assertTrue((out/'warmup.json').exists())
+        self.assertTrue((out/'rate1_run3.json').exists())
+        self.assertFalse((out/'rate1_run1.json').exists())
+        calls = [json.loads(line) for line in (self.root/'docker-calls.jsonl').read_text().splitlines()]
+        self.assertFalse(any('build' in call for call in calls))
+        self.assertTrue(any('up' in call for call in calls))
+        model = json.loads((out/'runtime/compose.json').read_text())
+        self.assertEqual(model['services']['order-service']['image'], 'independent-fixture-order:latest')
+        self.assertTrue((out/'business/rate1_run3.json').exists())
+
+    def test_healthy_socket_does_not_skip_tcp_database_probe(self):
+        result=self.run_runner(FAKE_DB_PROBE_FAILURES='3')
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertGreaterEqual(int((self.root/'probe-count.txt').read_text()),7)
+        calls=[json.loads(line) for line in (self.root/'docker-calls.jsonl').read_text().splitlines()]
+        probes=[c for c in calls if 'SELECT 1' in c]
+        self.assertTrue(all('127.0.0.1' in c for c in probes))
+        meta=json.loads((self.output/'metadata.json').read_text())
+        self.assertEqual(meta['environment']['DB_START_TIMEOUT_SECONDS'],'1800')
+
+    def test_database_startup_timeout_saves_diagnostics_before_load(self):
+        result=self.run_runner(FAKE_DB_PROBE_FAILURES='999999',DB_START_TIMEOUT_SECONDS='1')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Startup timeout: order-db',result.stderr)
+        self.assertTrue((self.output/'logs/readiness-order-db.log').exists())
+        self.assertFalse((self.output/'warmup.json').exists())
+
+    def test_broker_startup_timeout_stops_before_load(self):
+        result=self.run_runner(ARCHITECTURE='choreographed-saga',PILOT_ISOLATED='1',
+                               FAKE_BROKER_UNHEALTHY='1',BROKER_START_TIMEOUT_SECONDS='1')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Startup timeout: rabbitmq',result.stderr)
+        self.assertTrue((self.output/'logs/readiness-rabbitmq.log').exists())
+        self.assertFalse((self.output/'warmup.json').exists())
 
     def test_failed_diagnostic_snapshot_does_not_abort_synchronous_load_stages(self):
         result = self.run_runner(ARCHITECTURE='orchestrated-saga', PILOT_ISOLATED='1',

@@ -130,7 +130,7 @@ def plot(rows, runs, output, campaign_boundary=None):
     charts = [('availability.png', 'availability_pct', 'Sucesso HTTP (201 / requisições)', '%', 1),
               ('throughput.png', 'accepted_rps', 'Respostas HTTP 201 por segundo, incluindo drenagem', 'HTTP 201/s', 1),
               ('latency.png', 'successful_p95_ms', 'p95 da latência HTTP dos 201', 'segundos', .001),
-              ('business-confirmed.png', 'confirmed_pct', 'Pedidos confirmados após recuperação / disparos da coorte', '%', 1)]
+              ('business-confirmed.png', 'confirmed_pct', 'Pedidos confirmados após recuperação / requisições iniciadas na repetição', '%', 1)]
     for filename, metric, title, unit, scale in charts:
         fig, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
         if metric == 'accepted_rps':

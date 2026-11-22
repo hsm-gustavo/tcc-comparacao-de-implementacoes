@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 
-from compare_pilots import ARCHITECTURE_LABELS
+from compare_pilots import ARCHITECTURE_LABELS, COMPARISON_FONT_SIZES
 
 
 def percentile(values, q):
@@ -81,7 +81,8 @@ def generate(run, output):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(14, 8), constrained_layout=True)
+    plt.rcParams.update(COMPARISON_FONT_SIZES)
+    fig, ax = plt.subplots(figsize=(12, 7), constrained_layout=True)
     for architecture, label in ARCHITECTURE_LABELS.items():
         points = sorted([r for r in grouped if r['architecture'] == architecture], key=lambda r: r['rate'])
         x = [r['rate'] for r in points]
@@ -91,12 +92,13 @@ def generate(run, output):
     repetitions = {r['repetitions'] for r in grouped}
     subtitle = ('Mediana e faixa P25–P75 entre oito repetições' if repetitions == {8}
                 else 'Mediana e faixa P25–P75 entre repetições')
-    ax.set(title='Mock - p95 de todas as respostas HTTP\n' + subtitle,
-           xlabel='Taxa solicitada (requisições/s)', ylabel='p95 da latência HTTP (segundos)')
+    fig.suptitle('Mock — ' + subtitle)
+    ax.set(title='p95 de todas as respostas HTTP',
+           xlabel='Taxa solicitada (requisições/s)', ylabel='segundos')
     ax.set_xticks([1] + list(range(10, 101, 10)))
     ax.grid(alpha=.25)
     ax.legend(loc='upper left')
-    fig.savefig(output / 'mock-http-p95.png', dpi=160)
+    fig.savefig(output / 'mock-http-p95.png', dpi=200)
     plt.close(fig)
     (output / 'README.md').write_text('''# Mock — p95 de todas as respostas HTTP
 

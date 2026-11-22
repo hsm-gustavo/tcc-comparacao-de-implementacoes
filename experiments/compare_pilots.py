@@ -17,6 +17,15 @@ ARCHITECTURE_LABELS = {
     'choreographed-saga': 'Saga coreografada',
 }
 
+COMPARISON_FONT_SIZES = {
+    'axes.titlesize': 21,
+    'axes.labelsize': 18,
+    'legend.fontsize': 15,
+    'xtick.labelsize': 16,
+    'ytick.labelsize': 16,
+    'figure.titlesize': 16,
+}
+
 
 def effective_pool(root):
     path = root / 'application.log'
@@ -127,12 +136,13 @@ def plot(rows, runs, output, campaign_boundary=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    plt.rcParams.update(COMPARISON_FONT_SIZES)
     charts = [('availability.png', 'availability_pct', 'Sucesso HTTP (201 / requisições)', '%', 1),
               ('throughput.png', 'accepted_rps', 'Respostas HTTP 201 por segundo, incluindo drenagem', 'HTTP 201/s', 1),
               ('latency.png', 'successful_p95_ms', 'p95 da latência HTTP dos 201', 'segundos', .001),
-              ('business-confirmed.png', 'confirmed_pct', 'Pedidos confirmados após recuperação / requisições iniciadas na repetição', '%', 1)]
+              ('business-confirmed.png', 'confirmed_pct', 'Pedidos confirmados após recuperação /\nrequisições iniciadas na repetição', '%', 1)]
     for filename, metric, title, unit, scale in charts:
-        fig, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
+        fig, ax = plt.subplots(figsize=(12, 7), constrained_layout=True)
         if metric == 'accepted_rps':
             offered = sorted({r['rate'] for r in rows})
             ax.plot(offered, offered, ':', color='#555555', label='Disparos/s solicitados')
@@ -159,11 +169,12 @@ def plot(rows, runs, output, campaign_boundary=None):
         ax.grid(alpha=.25)
         if ax.lines:
             ax.legend()
-        subtitle = 'Mediana entre repetições; faixa P25–P75. HTTP não equivale a conclusão da saga assíncrona.'
+        subtitle = ('Mediana entre repetições, com faixa P25–P75.\n'
+                    'Na saga assíncrona, HTTP 201 indica aceitação do pedido.')
         if any(run.get('historical_versions') for run in runs):
             subtitle += '\nVisão histórica: campanhas e versões de código distintas; cobertura incompleta.'
-        fig.suptitle(subtitle, fontsize=10)
-        fig.savefig(output / filename, dpi=160)
+        fig.suptitle(subtitle)
+        fig.savefig(output / filename, dpi=200)
         plt.close(fig)
 
 

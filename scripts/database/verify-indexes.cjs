@@ -2,7 +2,7 @@
 /* Opt-in integration check. NEVER point this at an experiment database.
  * INDEX_TEST_PG_SOCKET=/tmp/disposable/socket node scripts/database/verify-indexes.cjs
  * INDEX_TEST_BUILD_ROOT may point at a temporary copy of implementation/.
- * Requires built services and their existing TypeORM/tsconfig-paths dependencies.
+ * Requires built services and their existing TypeORM dependencies.
  */
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -21,12 +21,7 @@ const requireService = createRequire(
   path.join(root, "distributed-baseline/order-service/package.json"),
 );
 const { DataSource } = requireService("typeorm");
-const unregister = requireService("tsconfig-paths").register({
-  baseUrl: path.join(root, "monolith/dist"),
-  paths: { "src/*": ["*"] },
-});
 const architectures = [
-  "monolith",
   "distributed-baseline",
   "tcc",
   "two-phase-commit",
@@ -51,11 +46,7 @@ function planIndexes(node) {
   ].filter(Boolean);
 }
 async function verify(architecture, service, ordinal) {
-  const project = path.join(
-    root,
-    architecture,
-    ...(service ? [service + "-service"] : []),
-  );
+  const project = path.join(root, architecture, service + "-service");
   const entities = entityFiles(path.join(project, "dist"))
     .flatMap((file) => Object.values(require(file)))
     .filter((value) => typeof value === "function");
@@ -78,25 +69,15 @@ async function verify(architecture, service, ordinal) {
       meta.indices.map((index) => ({ meta, index })),
     );
     const required =
-      architecture === "monolith"
-        ? {
-            IDX_order_items_order_id: ["orderId"],
-            IDX_order_items_product_id: ["productId"],
-          }
-        : service === "order"
-          ? { IDX_order_items_order_id: ["orderId"] }
-          : service === "billing"
-            ? { IDX_payments_order_id: ["orderId"] }
-            : service === "shipping"
-              ? { IDX_shipments_order_id: ["orderId"] }
-              : ["tcc", "two-phase-commit"].includes(architecture)
-                ? {
-                    IDX_stock_reservations_product_status: [
-                      "productId",
-                      "status",
-                    ],
-                  }
-                : {};
+      service === "order"
+        ? { IDX_order_items_order_id: ["orderId"] }
+        : service === "billing"
+          ? { IDX_payments_order_id: ["orderId"] }
+          : service === "shipping"
+            ? { IDX_shipments_order_id: ["orderId"] }
+            : ["tcc", "two-phase-commit"].includes(architecture)
+              ? { IDX_stock_reservations_product_status: ["productId", "status"] }
+              : {};
     assert.equal(expected.length, Object.keys(required).length);
     for (const [name, columns] of Object.entries(required)) {
       const match = expected.find(({ index }) => index.name === name);
@@ -120,24 +101,6 @@ async function verify(architecture, service, ordinal) {
         physical.some((row) => row.indexname === index.name),
         index.name,
       );
-    // One-to-one already creates unique indexes; adding another would be redundant.
-    if (architecture === "monolith") {
-      for (const table of ["payments", "shipments"]) {
-        const runner = db.createQueryRunner();
-        try {
-          const actual = await runner.getTable(`${schema}.${table}`);
-          assert(
-            actual.uniques.some(
-              (unique) =>
-                unique.columnNames.length === 1 &&
-                unique.columnNames[0] === "orderId",
-            ),
-          );
-        } finally {
-          await runner.release();
-        }
-      }
-    }
     const probes = [];
     for (const { meta, index } of expected) {
       const table = `${q(schema)}.${q(meta.tableName)}`;
@@ -243,16 +206,11 @@ async function verify(architecture, service, ordinal) {
 (async () => {
   let ordinal = 0;
   for (const architecture of architectures) {
-    const services =
-      architecture === "monolith"
-        ? [null]
-        : ["order", "warehouse", "billing", "shipping"];
-    for (const service of services)
+    for (const service of ["order", "warehouse", "billing", "shipping"])
       await verify(architecture, service, ordinal++);
   }
 })()
   .catch((error) => {
     console.error(error);
     process.exitCode = 1;
-  })
-  .finally(unregister);
+  });

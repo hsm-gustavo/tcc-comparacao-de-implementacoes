@@ -6,17 +6,13 @@ MODE="${1:-${MODE:-distributed}}"
 PRODUCT_COUNT="${PRODUCT_COUNT:-100}"
 INITIAL_STOCK="${INITIAL_STOCK:-100000}"
 
-if [[ "$MODE" == "monolith" ]]; then
-    BASE_URL="http://127.0.0.1:3000"
-    PREFIX=""
-elif [[ "$MODE" == "distributed" ]]; then
-    BASE_URL="http://127.0.0.1:8000"
-    PREFIX="/warehouse"
-else
-    echo "Error: Mode '$MODE' invalid. Use 'monolith' or 'distributed'."
+if [[ "$MODE" != "distributed" ]]; then
+    echo "Error: Mode '$MODE' invalid. Use 'distributed'." >&2
     exit 1
 fi
 
+BASE_URL="http://127.0.0.1:8000"
+PREFIX="/warehouse"
 HEALTH_URL="${BASE_URL}${PREFIX}/health"
 CREATE_PRODUCT_URL="${BASE_URL}/warehouse/products"
 

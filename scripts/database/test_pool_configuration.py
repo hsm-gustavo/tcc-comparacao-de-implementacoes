@@ -11,11 +11,11 @@ ARCHITECTURES = ('distributed-baseline', 'tcc', 'two-phase-commit',
 
 
 class PoolConfigurationTest(unittest.TestCase):
-    def test_same_defaults_and_environment_override_in_all_21_modules(self):
-        files = [ROOT / 'implementation/monolith/src/app.module.ts']
+    def test_same_defaults_and_environment_override_in_all_20_modules(self):
+        files = []
         for architecture in ARCHITECTURES:
             files.extend(sorted((ROOT / 'implementation' / architecture).glob('*-service/src/app.module.ts')))
-        self.assertEqual(len(files), 21)
+        self.assertEqual(len(files), 20)
         for file in files:
             with self.subTest(module=str(file.relative_to(ROOT))):
                 extra = re.findall(r'extra:\s*(\{[^}]+\})', file.read_text())
